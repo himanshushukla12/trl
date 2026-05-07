@@ -1,4 +1,4 @@
-# Copyright 2020-2025 The HuggingFace Team. All rights reserved.
+# Copyright 2020-2026 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -35,6 +35,7 @@ def think_format_reward(completions: list[list[dict[str, str]]], **kwargs) -> li
     Example:
     ```python
     >>> from trl.rewards import think_format_reward
+
     >>> completions = [
     ...     [{"content": "<think>\nThis is my reasoning.\n</think>\nThis is my answer."}],
     ...     [{"content": "<think>\nThis is my reasoning.\nThis is my answer."}],
