@@ -2339,6 +2339,33 @@ class TestComputeFlopsPerToken(TrlTestCase):
         assert compute_flops_per_token(cfg, 16384) == derived
 
     @pytest.mark.parametrize(
+        "q_lora_rank", [1536, None]
+    )  # low-rank queries (DeepSeek-V3) or a full projection (Moonlight)
+    def test_deepseek_v3_matches_six_flops_per_active_weight(self, q_lora_rank):
+        # Training costs 6 FLOPs per active weight per token, and `seq_len=0` drops the attention-score term. Layer 0
+        # stays dense and layer 1 is MoE, where only `num_experts_per_tok` of the routed experts run.
+        cfg = AutoConfig.from_pretrained("trl-internal-testing/tiny-DeepseekV3ForCausalLM")
+        cfg.first_k_dense_replace = 1
+        cfg.q_lora_rank = q_lora_rank
+        with torch.device("meta"):
+            model = AutoModelForCausalLM.from_config(cfg)
+        # Norms and the router bias are not matmuls, and the embedding is a lookup
+        weights = {
+            name: p.numel() for name, p in model.named_parameters() if p.ndim > 1 and "embed_tokens" not in name
+        }
+        routed = sum(numel for name, numel in weights.items() if ".mlp.experts." in name)
+        active = sum(weights.values()) - routed + routed * cfg.num_experts_per_tok // cfg.n_routed_experts
+        assert compute_flops_per_token(cfg, 0) == 6 * active
+
+    def test_deepseek_v3_attention_score_spans_qk_and_v_head_dims(self):
+        # In multi-head latent attention, Q·Kᵀ runs over `qk_head_dim` and attn·V over the smaller `v_head_dim`.
+        cfg = AutoConfig.from_pretrained("trl-internal-testing/tiny-DeepseekV3ForCausalLM")
+        per_token = compute_flops_per_token(cfg, 1) - compute_flops_per_token(cfg, 0)
+        assert per_token == 3 * cfg.num_hidden_layers * 2 * cfg.num_attention_heads * (
+            cfg.qk_head_dim + cfg.v_head_dim
+        )
+
+    @pytest.mark.parametrize(
         "model_id",
         [
             "trl-internal-testing/tiny-Gemma2ForCausalLM",  # sliding-window attention layers

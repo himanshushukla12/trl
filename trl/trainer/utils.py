@@ -1785,6 +1785,7 @@ def add_fused_lm_head(
 # Model types whose layers `compute_flops_per_token` describes: full attention in every layer, and a gate/up/down MLP
 # or routed experts of that shape. For each, the estimate matches 6 FLOPs per active weight on real checkpoints.
 _FLOPS_PER_TOKEN_MODEL_TYPES = (
+    "deepseek_v3",
     "gemma",
     "granite",
     "llama",
@@ -1822,16 +1823,30 @@ def compute_flops_per_token(config: PretrainedConfig, seq_len: int) -> int | Non
     L = config.num_hidden_layers
     V = config.vocab_size
     n_heads = config.num_attention_heads
-    n_kv_heads = config.num_key_value_heads
-    # `head_dim` is optional on configs: Llama and Mistral declare it, Qwen2 doesn't. Derive it when missing, like
-    # transformers' own modeling code does.
-    head_dim = getattr(config, "head_dim", None) or h // n_heads
 
-    # Attention: Q/K/V/O projections + attention score (Q·Kᵀ and attn·V).
-    qkv_flops = 2 * h * (n_heads * head_dim + 2 * n_kv_heads * head_dim)
-    o_proj_flops = 2 * n_heads * head_dim * h
-    attn_score_flops = 2 * 2 * n_heads * head_dim * seq_len
-    attn_flops = qkv_flops + o_proj_flops + attn_score_flops
+    if config.model_type == "deepseek_v3":
+        # Multi-head latent attention: queries (low-rank unless `q_lora_rank` is None) and keys span `qk_head_dim`,
+        # values `v_head_dim`, and keys and values are expanded from one shared `kv_lora_rank` latent.
+        if config.q_lora_rank is None:
+            q_flops = 2 * h * n_heads * config.qk_head_dim
+        else:
+            q_flops = 2 * config.q_lora_rank * (h + n_heads * config.qk_head_dim)
+        kv_flops = 2 * h * (config.kv_lora_rank + config.qk_rope_head_dim)
+        kv_flops += 2 * config.kv_lora_rank * n_heads * (config.qk_nope_head_dim + config.v_head_dim)
+        o_proj_flops = 2 * n_heads * config.v_head_dim * h
+        attn_score_flops = 2 * n_heads * (config.qk_head_dim + config.v_head_dim) * seq_len
+        attn_flops = q_flops + kv_flops + o_proj_flops + attn_score_flops
+    else:
+        n_kv_heads = config.num_key_value_heads
+        # `head_dim` is optional on configs: Llama and Mistral declare it, Qwen2 doesn't. Derive it when missing, like
+        # transformers' own modeling code does.
+        head_dim = getattr(config, "head_dim", None) or h // n_heads
+
+        # Attention: Q/K/V/O projections + attention score (Q·Kᵀ and attn·V).
+        qkv_flops = 2 * h * (n_heads * head_dim + 2 * n_kv_heads * head_dim)
+        o_proj_flops = 2 * n_heads * head_dim * h
+        attn_score_flops = 2 * 2 * n_heads * head_dim * seq_len
+        attn_flops = qkv_flops + o_proj_flops + attn_score_flops
 
     # MoE dispatch: `num_experts_per_tok` is the canonical MoE marker — present on Mixtral,
     # Qwen3-MoE, DeepSeek-V2, etc.; absent on dense configs.
@@ -1839,6 +1854,16 @@ def compute_flops_per_token(config: PretrainedConfig, seq_len: int) -> int | Non
     if num_experts_per_tok is None:
         mlp_flops = 2 * 3 * h * config.intermediate_size
         total_layer_flops = L * (attn_flops + mlp_flops)
+    elif config.model_type == "deepseek_v3":
+        # The first `first_k_dense_replace` layers are dense; the others run the active routed experts, the shared
+        # experts and the router.
+        moe_mlp_flops = (num_experts_per_tok + config.n_shared_experts) * 2 * 3 * h * config.moe_intermediate_size
+        moe_mlp_flops += 2 * h * config.n_routed_experts
+        dense_mlp_flops = 2 * 3 * h * config.intermediate_size
+        total_layer_flops = sum(
+            attn_flops + (dense_mlp_flops if layer_idx < config.first_k_dense_replace else moe_mlp_flops)
+            for layer_idx in range(L)
+        )
     else:
         # Routed experts (gate + up + down, 3 matmuls each) + router.
         if Version(transformers.__version__) >= Version("5.1.0"):
