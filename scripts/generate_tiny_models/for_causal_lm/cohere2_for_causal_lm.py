@@ -21,23 +21,44 @@ from .._common import (
     init_weights_tiny_model,
     print_config_diff,
     push_to_hub,
+    set_seed,
     smoke_test,
 )
 
 
 check_transformers_version()
 
+set_seed()
+
 MODEL_ID = "CohereLabs/tiny-aya-earth"
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 generation_config = GenerationConfig.from_pretrained(MODEL_ID)
 config = Cohere2Config(
-    vocab_size=len(tokenizer.vocab),
+    vocab_size=262144,
     hidden_size=8,
     num_attention_heads=4,
     num_key_value_heads=2,
+    head_dim=8,  # a multiple of 8, as Flash Attention requires
     num_hidden_layers=2,
     intermediate_size=32,
+    # One of each attention type. Deriving the pattern from num_hidden_layers=2 gives two sliding
+    # layers (the reference is 3:1), so the full-attention NoPE path would never run.
+    layer_types=["sliding_attention", "full_attention"],
+    logit_scale=1.0,
+    rope_theta=50000,
+    bos_token_id=2,
+    eos_token_id=3,
+    cache_implementation="hybrid",
+    layer_switch=4,
+    order_of_interleaved_layers="local_attn_first",
+    position_embedding_type="rope_gptj",
+    rotary_pct=1.0,
+    use_embedding_sharing=True,
+    use_gated_activation=True,
+    use_parallel_block=True,
+    use_parallel_embedding=False,
+    use_qk_norm=False,
 )
 model = Cohere2ForCausalLM(config).to(dtype=torch.bfloat16)
 init_weights_tiny_model(model)

@@ -22,14 +22,22 @@ from ...trainer.sft_config import SFTConfig
 @dataclass
 class GOLDConfig(SFTConfig):
     r"""
-    Configuration class for [`GOLDTrainer`].
+    Configuration class for [`experimental.gold.GOLDTrainer`].
 
     This class includes only the parameters that are specific to GOLD training. For a full list of training arguments,
     please refer to the [`~transformers.TrainingArguments`] and [`SFTConfig`] documentation.
 
     Args:
+        > Parameters that control generation and the training loop
+
         temperature (`float`, *optional*, defaults to `0.9`):
             Temperature for sampling. The higher the temperature, the more random the completions.
+        top_p (`float`, *optional*, defaults to `0.95`):
+            If set to float < 1, only the smallest set of most probable tokens with probabilities that add up to
+            `top_p` or higher are kept for generation.
+        top_k (`int`, *optional*, defaults to `0`):
+            Number of highest probability vocabulary tokens to keep for top-k-filtering. If `0`, top-k-filtering is
+            disabled and all tokens are considered.
         lmbda (`float`, *optional*, defaults to `0.5`):
             Lambda parameter that controls the student data fraction (i.e., the proportion of on-policy
             student-generated outputs).
@@ -46,7 +54,7 @@ class GOLDConfig(SFTConfig):
             revision is used.
         teacher_model_init_kwargs (`dict[str, Any]`, *optional*):
             Keyword arguments to pass to `AutoModelForCausalLM.from_pretrained` when instantiating the teacher model
-            from a string.
+            from a string. The `revision` value is also used when loading the teacher processing class.
         teacher_tokenizer_name_or_path (`str`, *optional*):
             Tokenizer name or path for the teacher model. If None when using ULD loss, will use the same tokenizer as
             the student model (not recommended for cross-tokenizer distillation).
@@ -55,14 +63,51 @@ class GOLDConfig(SFTConfig):
         seq_kd (`bool`, *optional*, defaults to `False`):
             Seq_kd parameter that controls whether to perform Sequence-Level KD (can be viewed as supervised FT on
             teacher-generated output).
+        use_privileged_context (`bool`, *optional*, defaults to `False`):
+            Whether to condition the teacher on per-example privileged context while leaving the student prompt
+            unchanged. This is supported only for text, off-policy standard JSD distillation.
+        teacher_prompt_template (`str`, *optional*):
+            Template used to construct the teacher prompt. It must contain `{prompt}` and may contain
+            `{privileged_context}`. When `None`, defaults to `"{prompt}\n\n{privileged_context}"`.
+        privileged_context_column (`str`, *optional*, defaults to `"privileged_context"`):
+            Dataset column containing the per-example privileged context used to construct the teacher prompt.
         num_generations (`int`, *optional*, defaults to `1`):
             Number of generations per prompt. Each prompt is repeated this many times in the generation batch.
         generation_batch_size (`int` or `None`, *optional*, defaults to `None`):
             Number of unique prompts per worker per optimizer step. If `None`, it is computed from
             `(per_device_train_batch_size * gradient_accumulation_steps) // num_generations`.
+        > Parameters that control the ULD loss
+
         use_uld_loss (`bool`, *optional*, defaults to `False`):
             Whether to use Universal Logit Distillation (ULD) loss instead of Generalized Jensen-Shannon Divergence
             loss.
+        use_extended_uld (`bool`, *optional*, defaults to `True`):
+            Whether to enable extended ULD alignment that uses tokenizers to align and merge token probabilities across
+            student and teacher tokenizations. When `True`, the trainer will compute token mappings and merge
+            probabilities for split tokens; when `False`, ULD will use simple positional truncation like in the
+            original ULD paper. Set to `False` for tokenizers that are neither ByteLevel nor byte-fallback BPE (e.g.
+            Llama 2).
+        uld_token_merge_strategy (`str`, *optional*, defaults to `"observed"`):
+            Strategy used to align answer logits and merge token probabilities in the ULD loss. With `"observed"`, the
+            answer logits are sliced at the answer positions and split tokens (when `use_extended_uld=True`) are merged
+            by multiplying the marginal distribution at the first position by the scalar conditional probabilities of
+            the actual later tokens. With `"bayesian"`, the answer-logit slice is shifted one position earlier so that
+            `probs[k]` predicts `token_ids[k]` (chain rule), and split tokens are merged using the last position's full
+            distribution, conditioned on the actual prefix tokens, multiplied by the scalar probabilities of the
+            earlier tokens. The logit-alignment shift applies whether or not `use_extended_uld` is enabled.
+        uld_use_hybrid_loss (`bool`, *optional*, defaults to `False`):
+            Whether to use a hybrid loss that combines ULD loss and JSD loss. When `True`, the final loss is a
+            combination of JSD for known token mappings and ULD for unknown token mappings.
+        uld_hybrid_matched_weight (`float` or `None`, *optional*):
+            Weight for the matched token loss component when using hybrid ULD + JSD loss. This weight scales the JSD
+            loss computed over tokens that have a direct mapping between student and teacher tokenizations. If `None`,
+            uses adaptive weighting based on vocabulary overlap. Must be set together with
+            `uld_hybrid_unmatched_weight` (both `None` or both `float`).
+        uld_hybrid_unmatched_weight (`float` or `None`, *optional*):
+            Weight for the unmatched token loss component when using hybrid ULD + JSD loss. This weight scales the ULD
+            loss computed over tokens that do not have a direct mapping between student and teacher tokenizations. If
+            `None`, uses adaptive weighting based on vocabulary overlap. Must be set together with
+            `uld_hybrid_matched_weight` (both `None` or both `float`).
         uld_crossentropy_weight (`float`, *optional*, defaults to `0.0`):
             Weight for the cross-entropy loss component in ULD loss. If 0, only ULD distillation loss is used.
         uld_distillation_weight (`float`, *optional*, defaults to `1.0`):
@@ -75,10 +120,33 @@ class GOLDConfig(SFTConfig):
             Whether to skip EOS token for student in ULD loss computation.
         uld_skip_teacher_eos (`bool`, *optional*, defaults to `True`):
             Whether to skip EOS token for teacher in ULD loss computation.
+        > Parameters for X-Token cross-tokenizer KD (https://huggingface.co/papers/2605.21699)
+
+        xtoken_loss_type (`str`, *optional*, defaults to `"none"`):
+            Cross-tokenizer KD variant: `"none"` (disabled), `"p_kl"` (projection KL), or `"h_kl"` (hybrid KL with
+            relaxed common set). Requires `teacher_tokenizer_name_or_path` and `xtoken_projection_matrix_path`.
+        xtoken_projection_matrix_path (`str`, *optional*):
+            Path to a precomputed projection matrix file. Required when `xtoken_loss_type != "none"`.
+        xtoken_temperature (`float`, *optional*, defaults to `1.0`):
+            Temperature T for X-Token KD loss; the loss is multiplied by T² (Hinton 2015).
+        xtoken_dynamic_scaling (`bool`, *optional*, defaults to `True`):
+            Scale KD by `stop_gradient(abs(CE) / abs(KD))` per microbatch to balance loss magnitudes (paper Eq. 7).
+        xtoken_uncommon_topk (`int`, *optional*, defaults to `8192`):
+            H-KL: cap sorted-L1 uncommon comparison to the top-k tokens per side.
+        xtoken_vocab_topk (`int`, *optional*, defaults to `8192`):
+            P-KL: restrict KL to the global top-k teacher tokens by max logit. Interacts with the projection matrix
+            `--top-k`: teacher tokens outside the matrix's reach get near-zero projected student mass and dominate the
+            KL, so smaller values concentrate the loss on tokens the student can match.
+        xtoken_kl_weight (`float`, *optional*, defaults to `1.0`):
+            Weight for the X-Token KD term when `xtoken_dynamic_scaling=False`.
+        xtoken_ce_scale (`float`, *optional*, defaults to `0.1`):
+            Scale factor for the CE term in the X-Token loss when `xtoken_dynamic_scaling=False`.
+        > Parameters that control vLLM integration
+
         use_vllm (`bool`, *optional*, defaults to `False`):
             Whether to use vLLM for generating completions from the student model. Requires `vllm` to be installed.
         vllm_mode (`str`, *optional*, defaults to `"colocate"`):
-            Mode for student vLLM integration. Either `"server"` (connect to a running TRL vLLM server) or `"colocate"`
+            Mode for student vLLM integration. Either `"server"` (connect to a running vLLM server) or `"colocate"`
             (run vLLM in the same process).
         vllm_server_host (`str`, *optional*, defaults to `"0.0.0.0"`):
             Host of the vLLM server for the student model (if `vllm_mode="server"`).
@@ -110,6 +178,25 @@ class GOLDConfig(SFTConfig):
         vllm_enable_sleep_mode (`bool`, *optional*, defaults to `False`):
             Enable vLLM sleep mode to offload student weights/cache during the optimizer step. Keeps GPU memory usage
             low, but waking the engine adds host–device transfer latency.
+
+        > Parameters that control logging
+
+        log_completions (`bool`, *optional*, defaults to `False`):
+            Whether to log a sample of (prompt, completion) pairs every `logging_steps` steps. If `rich` is installed,
+            it prints the sample. If `wandb` logging is enabled, it logs it to `wandb`.
+        log_completions_steps (`int`, *optional*, defaults to `100`):
+            Number of steps between logging (prompt, completion) pairs. Only used if `log_completions` is set to
+            `True`.
+        num_completions_to_print (`int` or `None`, *optional*):
+            Number of completions to print with `rich`. If `None`, all completions are logged.
+        wandb_log_unique_prompts (`bool`, *optional*, defaults to `True`):
+            Whether to log the unique prompts to wandb. This will create a new run for each unique prompt.
+        callbacks (`list[str]`, *optional*, defaults to `[]`):
+            The callbacks to run during training.
+
+    > [!NOTE]
+    > These parameters have default values different from [`~transformers.TrainingArguments`]:
+    > - `learning_rate`: Defaults to `1e-7` instead of `5e-5`.
     """
 
     _VALID_DICT_FIELDS = SFTConfig._VALID_DICT_FIELDS + ["teacher_model_init_kwargs"]
@@ -176,7 +263,7 @@ class GOLDConfig(SFTConfig):
         default=None,
         metadata={
             "help": "Keyword arguments to pass to `AutoModelForCausalLM.from_pretrained` when instantiating the "
-            "teacher model from a string."
+            "teacher model from a string. The `revision` value is also used when loading the teacher processing class."
         },
     )
     teacher_tokenizer_name_or_path: str | None = field(
@@ -196,6 +283,24 @@ class GOLDConfig(SFTConfig):
             "help": "Seq_kd parameter that controls whether to perform Sequence-Level KD (can be viewed as supervised "
             "FT on teacher-generated output)."
         },
+    )
+    use_privileged_context: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to condition the teacher on per-example privileged context while leaving the student "
+            "prompt unchanged. Only supported for text, off-policy standard JSD distillation."
+        },
+    )
+    teacher_prompt_template: str | None = field(
+        default=None,
+        metadata={
+            "help": "Template used to construct the teacher prompt. Must contain `{prompt}` and may contain "
+            "`{privileged_context}`. If None, defaults to `{prompt}\\n\\n{privileged_context}`."
+        },
+    )
+    privileged_context_column: str = field(
+        default="privileged_context",
+        metadata={"help": "Dataset column containing the per-example privileged context for the teacher prompt."},
     )
     num_generations: int = field(
         default=1,
@@ -218,6 +323,21 @@ class GOLDConfig(SFTConfig):
             "help": "Whether to use Universal Logit Distillation (ULD) loss instead of Generalized Jensen-Shannon Divergence loss."
         },
     )
+    uld_token_merge_strategy: str = field(
+        default="observed",
+        metadata={
+            "help": (
+                'Strategy used to align answer logits and merge token probabilities in the ULD loss. With "observed", '
+                "the answer logits are sliced at the answer positions and split tokens (when use_extended_uld=True) "
+                "are merged by multiplying the marginal distribution at the first position by the scalar conditional "
+                'probabilities of the actual later tokens. With "bayesian", the answer-logit slice is shifted one '
+                "position earlier so probs[k] predicts token_ids[k] (chain rule), and split tokens are merged using "
+                "the last position's full distribution, conditioned on the actual prefix tokens, multiplied by the "
+                "scalar probabilities of the earlier tokens. The logit-alignment shift applies whether or not "
+                "use_extended_uld is enabled."
+            )
+        },
+    )
     use_extended_uld: bool = field(
         default=True,
         metadata={
@@ -225,7 +345,8 @@ class GOLDConfig(SFTConfig):
                 "Whether to enable extended ULD alignment that uses tokenizers to align and merge token "
                 "probabilities across student and teacher tokenizations. When True, the trainer will compute "
                 "token mappings and merge probabilities for split tokens; when False, ULD will use simple "
-                "positional truncation like in the original ULD paper."
+                "positional truncation like in the original ULD paper. Set to False for tokenizers that are "
+                "neither ByteLevel nor byte-fallback BPE (e.g. Llama 2)."
             )
         },
     )
@@ -286,6 +407,87 @@ class GOLDConfig(SFTConfig):
         metadata={"help": "Whether to skip EOS token for teacher in ULD loss computation."},
     )
 
+    # X-Token parameters
+    xtoken_loss_type: str = field(
+        default="none",
+        metadata={
+            "help": (
+                'Cross-tokenizer KD loss variant. "none" disables X-Token; "p_kl" uses full-vocab '
+                'projection (P-KL, Eq. 4 in https://huggingface.co/papers/2605.21699); "h_kl" uses '
+                "the relaxed common-set hybrid (H-KL, Eq. 3 and 5). Requires `teacher_tokenizer_name_or_path` "
+                "and `xtoken_projection_matrix_path`."
+            )
+        },
+    )
+    xtoken_projection_matrix_path: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Path to a precomputed projection matrix file (torch.save'd dict with 'indices' and "
+                "'likelihoods' tensors for the dense top-k format, or dict[(s_id, t_id)] -> count for "
+                "the sparse multi-token format). Required when `xtoken_loss_type != 'none'`. See "
+                "https://huggingface.co/papers/2605.21699 Algorithm 2 for construction details."
+            )
+        },
+    )
+    xtoken_temperature: float = field(
+        default=1.0,
+        metadata={
+            "help": (
+                "Temperature T for X-Token KD loss. The loss is multiplied by T² so gradient magnitudes "
+                "stay temperature-independent (Hinton 2015). Independent of the sampling temperature."
+            )
+        },
+    )
+    xtoken_dynamic_scaling: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "When True, scale the KD loss by stop_gradient(abs(CE) / abs(KD)) before adding CE, keeping CE and "
+                "KD magnitudes balanced per microbatch (X-Token paper Eq. 7)."
+            )
+        },
+    )
+    xtoken_uncommon_topk: int = field(
+        default=8192,
+        metadata={
+            "help": (
+                "H-KL only: cap the uncommon-partition sorted-L1 comparison to the top-k tokens on each "
+                "side. 0 means no cap (all tokens compared). Reducing this saves memory at the cost of "
+                "less signal from the long tail."
+            )
+        },
+    )
+    xtoken_vocab_topk: int = field(
+        default=8192,
+        metadata={
+            "help": (
+                "P-KL only: after projecting student probs to teacher vocab, compute forward KL only over "
+                "the global top-k teacher tokens (by max logit across the chunk batch). 0 means full vocab. "
+                "Interacts with the projection matrix --top-k: teacher tokens outside the matrix's reach get "
+                "near-zero projected student mass and dominate the KL, so smaller values concentrate the loss "
+                "on tokens the student can match."
+            )
+        },
+    )
+    xtoken_kl_weight: float = field(
+        default=1.0,
+        metadata={
+            "help": (
+                "Weight for the X-Token KD loss relative to the CE loss. Only used when "
+                "`xtoken_dynamic_scaling=False`."
+            )
+        },
+    )
+    xtoken_ce_scale: float = field(
+        default=0.1,
+        metadata={
+            "help": (
+                "Scale factor for the CE term in the X-Token loss. Only used when `xtoken_dynamic_scaling=False`."
+            )
+        },
+    )
+
     # vLLM parameters
     use_vllm: bool = field(
         default=False,
@@ -294,7 +496,7 @@ class GOLDConfig(SFTConfig):
     vllm_mode: str = field(
         default="colocate",
         metadata={
-            "help": 'Mode for vLLM integration. Either "server" (connect to a running TRL vLLM server) or "colocate" (run vLLM in the same process).'
+            "help": 'Mode for vLLM integration. Either "server" (connect to a running vLLM server) or "colocate" (run vLLM in the same process).'
         },
     )
     vllm_server_base_url: str | None = field(
@@ -375,18 +577,6 @@ class GOLDConfig(SFTConfig):
         default=None,
         metadata={"help": "Number of completions to print with `rich`. If `None`, all completions are logged."},
     )
-    wandb_entity: str | None = field(
-        default=None,
-        metadata={"help": ("The entity to store runs under.")},
-    )
-    wandb_project: str | None = field(
-        default=None,
-        metadata={"help": ("The project to store runs under.")},
-    )
-    wandb_run_group: str | None = field(
-        default=None,
-        metadata={"help": ("The group to store runs under.")},
-    )
     wandb_log_unique_prompts: bool = field(
         default=True,
         metadata={
@@ -397,11 +587,6 @@ class GOLDConfig(SFTConfig):
         default_factory=lambda: [],
         metadata={"help": "The callbacks to run during training."},
     )
-    hub_model_revision: str | None = field(
-        default="main", metadata={"help": "The Hub model branch to push the model to."}
-    )
-    overwrite_hub_revision: bool = field(default=False, metadata={"help": "Whether to overwrite the Hub revision."})
-    push_to_hub_revision: bool = field(default=False, metadata={"help": "Whether to push to a Hub revision/branch."})
 
     def __post_init__(self):
         super().__post_init__()
@@ -411,6 +596,20 @@ class GOLDConfig(SFTConfig):
             raise ValueError("lmbda must be in the range [0.0, 1.0].")
         if self.beta < 0.0 or self.beta > 1.0:
             raise ValueError("beta must be in the range [0.0, 1.0].")
+
+        if self.use_privileged_context:
+            if self.lmbda > 0:
+                raise ValueError("`use_privileged_context=True` requires `lmbda=0` (off-policy training only).")
+            if self.seq_kd:
+                raise ValueError("`use_privileged_context=True` cannot be combined with `seq_kd=True`.")
+            if self.use_uld_loss:
+                raise ValueError("`use_privileged_context=True` cannot be combined with `use_uld_loss=True`.")
+            if self.xtoken_loss_type != "none":
+                raise ValueError("`use_privileged_context=True` cannot be combined with X-Token KD.")
+            if self.use_liger_kernel:
+                raise ValueError("`use_privileged_context=True` cannot be combined with `use_liger_kernel=True`.")
+            if self.teacher_prompt_template is not None and "{prompt}" not in self.teacher_prompt_template:
+                raise ValueError("`teacher_prompt_template` must contain the `{prompt}` placeholder.")
 
         # Validate that max_length is sufficient for max_completion_length
         if self.max_length is not None and self.max_completion_length >= self.max_length:
@@ -453,6 +652,11 @@ class GOLDConfig(SFTConfig):
                 raise ValueError("uld_student_temperature must be positive.")
             if self.uld_teacher_temperature <= 0.0:
                 raise ValueError("uld_teacher_temperature must be positive.")
+            if self.uld_token_merge_strategy not in ("observed", "bayesian"):
+                raise ValueError(
+                    'uld_token_merge_strategy must be either "observed" or "bayesian", got '
+                    f'"{self.uld_token_merge_strategy}".'
+                )
 
             # Validate hybrid loss weights - both must be None or both must be set
             if self.uld_use_hybrid_loss:
@@ -468,3 +672,31 @@ class GOLDConfig(SFTConfig):
                         raise ValueError("uld_hybrid_matched_weight must be non-negative.")
                     if self.uld_hybrid_unmatched_weight < 0.0:
                         raise ValueError("uld_hybrid_unmatched_weight must be non-negative.")
+
+        # Validate X-Token parameters
+        _valid_xtoken_types = ("none", "p_kl", "h_kl")
+        if self.xtoken_loss_type not in _valid_xtoken_types:
+            raise ValueError(f"xtoken_loss_type must be one of {_valid_xtoken_types}, got '{self.xtoken_loss_type}'.")
+        if self.xtoken_loss_type != "none":
+            if self.lmbda != 0.0:
+                raise ValueError(
+                    "X-Token KD is off-policy only: set lmbda=0.0 when xtoken_loss_type != 'none'. "
+                    f"Got lmbda={self.lmbda}."
+                )
+            if self.xtoken_projection_matrix_path is None:
+                raise ValueError("xtoken_projection_matrix_path must be set when xtoken_loss_type != 'none'.")
+            if self.xtoken_temperature <= 0.0:
+                raise ValueError("xtoken_temperature must be positive.")
+            if self.xtoken_kl_weight < 0.0:
+                raise ValueError("xtoken_kl_weight must be non-negative.")
+            if self.xtoken_ce_scale < 0.0:
+                raise ValueError("xtoken_ce_scale must be non-negative.")
+            if self.xtoken_uncommon_topk < 0:
+                raise ValueError("xtoken_uncommon_topk must be non-negative.")
+            if self.xtoken_vocab_topk < 0:
+                raise ValueError("xtoken_vocab_topk must be non-negative.")
+        if self.xtoken_loss_type != "none" and self.use_uld_loss:
+            raise ValueError(
+                "`xtoken_loss_type` and `use_uld_loss` are mutually exclusive — use one cross-tokenizer "
+                "KD approach at a time."
+            )

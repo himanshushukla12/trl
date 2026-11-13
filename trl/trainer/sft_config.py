@@ -21,7 +21,6 @@ from .base_config import _BaseConfig
 
 @dataclass
 class SFTConfig(_BaseConfig):
-    # docstyle-ignore
     r"""
     Configuration class for the [`SFTTrainer`].
 
@@ -38,9 +37,15 @@ class SFTConfig(_BaseConfig):
 
         model_init_kwargs (`dict[str, Any]`, *optional*):
             Keyword arguments for [`~transformers.AutoModelForCausalLM.from_pretrained`], used when the `model`
-            argument of the [`SFTTrainer`] is provided as a string. If you're training a MoE architecture and want to
-            include the load balancing/auxiliary loss as a part of the final loss, remember to set
-            `output_router_logits=True` in this dictionary.
+            argument of the [`SFTTrainer`] is provided as a string. The `revision` value is also used when loading the
+            processing class.
+        trust_remote_code (`bool`, *optional*, defaults to `False`):
+            Whether to allow loading models and tokenizers that ship custom Python code from the Hub. Forwarded to
+            [`~transformers.AutoModelForCausalLM.from_pretrained`] and [`~transformers.AutoProcessor.from_pretrained`].
+        router_aux_loss_coef (`float`, *optional*):
+            Coefficient of the load-balancing auxiliary loss for Mixture-of-Experts (MoE) models, added to the training
+            loss with this weight. When not set, the value declared by the model config is used. Set to `0.0` to
+            disable it. Fails when used with a non-MoE model.
         chat_template_path (`str`, *optional*):
             If specified, sets the model's chat template. This can either be the path to a tokenizer (local directory
             or Hugging Face Hub model) or a direct path to a Jinja template file. When using a Jinja file, you must
@@ -53,20 +58,20 @@ class SFTConfig(_BaseConfig):
             Name of the column that contains text data in the dataset.
         dataset_kwargs (`dict[str, Any]`, *optional*):
             Dictionary of optional keyword arguments for the dataset preparation. The only supported key is
-            `skip_prepare_dataset`. When the model is a VLM, `skip_prepare_dataset` is automatically treated as `True`
-            regardless of the provided value, since preprocessing is done on the fly.
+            `skip_prepare_dataset`. When the dataset contains images, `skip_prepare_dataset` is automatically treated
+            as `True` regardless of the provided value, since preprocessing is done on the fly.
         dataset_num_proc (`int`, *optional*):
             Number of processes to use for processing the dataset.
         eos_token (`str`, *optional*):
             Token used to indicate the end of a turn or sequence. If `None`, it defaults to
             `processing_class.eos_token`.
         max_length (`int` or `None`, *optional*, defaults to `1024`):
-            Maximum length of the tokenized sequence. Sequences longer than `max_length` are truncated from the left
-            or right depending on `truncation_mode`. If `None`, no truncation is applied. When packing is enabled,
-            this value sets the sequence length.
+            Maximum length of the tokenized sequence. Sequences longer than `max_length` are truncated from the left or
+            right depending on `truncation_mode`. If `None`, no truncation is applied. When packing is enabled, this
+            value sets the sequence length.
         truncation_mode (`str`, *optional*, defaults to `"keep_start"`):
-            Truncation mode to use when the sequence exceeds `max_length`. The only supported value is
-            `"keep_start"`. The `"keep_end"` value is deprecated and will be removed in v2.0.0.
+            Truncation mode to use when the sequence exceeds `max_length`. The only supported value is `"keep_start"`.
+            The `"keep_end"` value is deprecated and will be removed in v2.0.0.
         shuffle_dataset (`bool`, *optional*, defaults to `False`):
             Whether to shuffle the dataset.
         packing (`bool`, *optional*, defaults to `False`):
@@ -81,8 +86,9 @@ class SFTConfig(_BaseConfig):
             supported with the FlashAttention 2 or 3, which can efficiently handle the flattened batch structure. When
             packing is enabled with strategy `"bfd"`, padding-free is enabled, regardless of the value of this
             parameter.
-        pad_to_multiple_of (`int`, *optional*):
-            If set, the sequences will be padded to a multiple of this value.
+        pad_to_multiple_of (`int` or `str`, *optional*, defaults to `"auto"`):
+            If set, the sequences will be padded to a multiple of this value. `"auto"` pads to a multiple of 128 on
+            Neuron (AWS Trainium), which compiles once per input shape, and does not pad elsewhere.
         eval_packing (`bool`, *optional*):
             Whether to pack the eval dataset. If `None`, uses the same value as `packing`.
 
@@ -101,14 +107,11 @@ class SFTConfig(_BaseConfig):
         loss_type (`str`, *optional*, defaults to `"nll"`):
             Type of loss to use. Possible values are:
 
-            - `"nll"`: standard negative log-likelihood (default).
-            - `"dft"`: Dynamic Fine-Tuning, as described in
-              [this paper](https://huggingface.co/papers/2508.05629).
-            - `"chunked_nll"`: same math as `"nll"`, but the `lm_head` projection is computed on non-ignored tokens
-              only (positions with `labels == -100` are dropped before the matmul) and the cross-entropy is processed
-              in chunks of tokens to reduce peak activation memory. Not compatible with `use_liger_kernel`, PEFT, or
-              VLM models. Under FSDP2, set `fsdp_reshard_after_forward false` in the accelerate config — the chunked
-              path otherwise re-gathers `lm_head.weight` per chunk during backward, adding noticeable wall-time.
+            - `"nll"`: standard negative log-likelihood.
+            - `"dft"`: Dynamic Fine-Tuning, as described in [this paper](https://huggingface.co/papers/2508.05629).
+            - `"chunked_nll"`: deprecated alias of `"nll"`, which computes the loss the same way. It will be removed in
+              v2.0.0.
+
         activation_offloading (`bool`, *optional*, defaults to `False`):
             Whether to offload the activations to the CPU.
 
@@ -131,7 +134,7 @@ class SFTConfig(_BaseConfig):
     > - `learning_rate`: Defaults to `2e-5` instead of `5e-5`.
     """
 
-    _VALID_DICT_FIELDS = _BaseConfig._VALID_DICT_FIELDS + ["model_init_kwargs"]
+    _VALID_DICT_FIELDS = _BaseConfig._VALID_DICT_FIELDS + ["model_init_kwargs", "dataset_kwargs"]
 
     # Parameters whose default values are overridden from TrainingArguments
     learning_rate: float = field(
@@ -144,9 +147,23 @@ class SFTConfig(_BaseConfig):
         default=None,
         metadata={
             "help": "Keyword arguments for `AutoModelForCausalLM.from_pretrained`, used when the `model` argument of "
-            "the `SFTTrainer` is provided as a string. If you're training a MoE architecture and want to include the "
-            "load balancing/auxiliary loss as a part of the final loss, remember to set `output_router_logits=True` "
-            "in this dictionary."
+            "the `SFTTrainer` is provided as a string. The `revision` value is also used when loading the processing "
+            "class."
+        },
+    )
+    trust_remote_code: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to allow loading models and tokenizers that ship custom Python code from the Hub. "
+            "Forwarded to `AutoModelForCausalLM.from_pretrained` and `AutoProcessor.from_pretrained`."
+        },
+    )
+    router_aux_loss_coef: float | None = field(
+        default=None,
+        metadata={
+            "help": "Coefficient of the load-balancing auxiliary loss for Mixture-of-Experts (MoE) models, added to "
+            "the training loss with this weight. When not set, the value declared by the model config is used. Set "
+            "to `0.0` to disable it. Fails when used with a non-MoE model."
         },
     )
     chat_template_path: str | None = field(
@@ -164,13 +181,12 @@ class SFTConfig(_BaseConfig):
         default="text",
         metadata={"help": "Name of the column that contains text data in the dataset."},
     )
-    dataset_kwargs: dict[str, Any] | None = field(
+    dataset_kwargs: dict[str, Any] | str | None = field(
         default=None,
         metadata={
             "help": "Dictionary of optional keyword arguments for the dataset preparation. The only supported key is "
-            "`skip_prepare_dataset`. If the model is a VLM, `skip_prepare_dataset` value is ignored. When the model "
-            "is a VLM, `skip_prepare_dataset` is automatically treated as `True` regardless of the provided value, "
-            "since preprocessing is done on the fly."
+            "`skip_prepare_dataset`. When the dataset contains images, `skip_prepare_dataset` is automatically "
+            "treated as `True` regardless of the provided value, since preprocessing is done on the fly."
         },
     )
     dataset_num_proc: int | None = field(
@@ -229,9 +245,12 @@ class SFTConfig(_BaseConfig):
             "value of this parameter."
         },
     )
-    pad_to_multiple_of: int | None = field(
-        default=None,
-        metadata={"help": "If set, the sequences will be padded to a multiple of this value."},
+    pad_to_multiple_of: int | str | None = field(
+        default="auto",
+        metadata={
+            "help": "If set, the sequences will be padded to a multiple of this value. `'auto'` pads to a multiple of "
+            "128 on Neuron (AWS Trainium), which compiles once per input shape, and does not pad elsewhere."
+        },
     )
     eval_packing: bool | None = field(
         default=None,
@@ -264,10 +283,9 @@ class SFTConfig(_BaseConfig):
     loss_type: str = field(
         default="nll",
         metadata={
-            "help": "Type of loss to use. Possible values are `'nll'` (negative log-likelihood, default), `'dft'` "
-            "(Dynamic Fine-Tuning, https://huggingface.co/papers/2508.05629), and `'chunked_nll'` (same math as "
-            "`'nll'` but skips the `'lm_head'` matmul on ignored tokens and chunks the CE to reduce peak memory; not "
-            "compatible with Liger, PEFT, or VLM)."
+            "help": "Type of loss to use. Possible values are `'nll'` (standard negative log-likelihood) and `'dft'` "
+            "(Dynamic Fine-Tuning, https://huggingface.co/papers/2508.05629).",
+            "choices": ["nll", "dft", "chunked_nll"],
         },
     )
     activation_offloading: bool = field(
@@ -285,6 +303,22 @@ class SFTConfig(_BaseConfig):
 
     def __post_init__(self):
         super().__post_init__()
+        # The CLI passes the value as a string
+        if isinstance(self.pad_to_multiple_of, str) and self.pad_to_multiple_of != "auto":
+            self.pad_to_multiple_of = (
+                None if self.pad_to_multiple_of.lower() in ("none", "null") else int(self.pad_to_multiple_of)
+            )
+        if self.pad_to_multiple_of == "auto":
+            # Neuron compiles once per input shape, so padding bounds the number of compilations
+            self.pad_to_multiple_of = 128 if self.device.type == "neuron" else None
+        if self.loss_type == "chunked_nll":
+            warnings.warn(
+                "`loss_type='chunked_nll'` is deprecated and will be removed in v2.0.0. Use `loss_type='nll'` (the "
+                "default), which computes the loss the same way, without materializing the full logits.",
+                FutureWarning,
+                stacklevel=3,
+            )
+            self.loss_type = "nll"
         if self.pad_token is not None:
             warnings.warn(
                 "`pad_token` is deprecated and will be removed in v2.0.0. "

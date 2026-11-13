@@ -13,9 +13,17 @@
 # limitations under the License.
 
 import os
+from pathlib import Path
 
-from transformers import Trainer, is_wandb_available
+import torch
+import transformers
+from accelerate.utils import is_peft_model
+from datasets import Dataset
+from huggingface_hub.utils import send_telemetry
+from packaging.version import Version
+from transformers import CONFIG_MAPPING, Trainer, is_wandb_available
 
+from .. import __version__
 from .utils import generate_model_card, get_comet_experiment_url, get_config_model_id, get_trackio_space_url
 
 
@@ -23,11 +31,144 @@ if is_wandb_available():
     import wandb
 
 
+# Trainer class names that may appear in telemetry topics. Any class outside this set — internal helpers,
+# in-flight subclasses not yet shipped, user-defined subclasses — is reported under the `_name` it carries (see
+# `_TELEMETRY_TRAINER_NAMES`) or as "other", so unreleased or private names never leak. Adding a new trainer requires
+# an explicit entry here and in `_TELEMETRY_TRAINER_NAMES`.
+_TELEMETRY_TRAINERS = {
+    # Stable
+    "AsyncGRPOTrainer",
+    "DistillationTrainer",
+    "DPOTrainer",
+    "GRPOTrainer",
+    "KTOTrainer",
+    "RewardTrainer",
+    "RLOOTrainer",
+    "SFTTrainer",
+    # Experimental
+    "A2POTrainer",
+    "AsyncDistillationTrainer",
+    "CPOTrainer",
+    "GKDTrainer",
+    "GMPOTrainer",
+    "GOLDTrainer",
+    "IWOPDTrainer",
+    "OnlineDPOTrainer",
+    "ORPOTrainer",
+    "SDFTTrainer",
+    "SDPOTrainer",
+    "ServerDistillationTrainer",
+}
+
+# The same trainers, by their `_name`. A subclass inherits its trainer's `_name`, and so does a copy of the trainer's
+# code, such as Unsloth's `UnslothSFTTrainer`. `GMPOTrainer` inherits GRPO's `_name`, so it has no entry of its own.
+_TELEMETRY_TRAINER_NAMES = {
+    # Stable
+    "AsyncGRPO": "AsyncGRPOTrainer",
+    "Distillation": "DistillationTrainer",
+    "DPO": "DPOTrainer",
+    "GRPO": "GRPOTrainer",
+    "KTO": "KTOTrainer",
+    "Reward": "RewardTrainer",
+    "RLOO": "RLOOTrainer",
+    "SFT": "SFTTrainer",
+    # Experimental
+    "A2PO": "A2POTrainer",
+    "AsyncDistillation": "AsyncDistillationTrainer",
+    "CPO": "CPOTrainer",
+    "GKD": "GKDTrainer",
+    "GOLD": "GOLDTrainer",
+    "IW-OPD": "IWOPDTrainer",
+    "Online DPO": "OnlineDPOTrainer",
+    "ORPO": "ORPOTrainer",
+    "SDFT": "SDFTTrainer",
+    "SDPO": "SDPOTrainer",
+    "Server Distillation": "ServerDistillationTrainer",
+}
+
+
 class _BaseTrainer(Trainer):
+    # Whether `compute_loss` already scales the loss for gradient accumulation, see `Trainer.loss_is_scaled_for_ga`
+    loss_is_scaled_for_ga = None
+
     _tag_names = []
     _name = "Base"
     _paper = {}
     _template_file = None
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # `Trainer.loss_is_scaled_for_ga` requires transformers 5.19; older versions only read these two attributes
+        if Version(transformers.__version__) < Version("5.19.0") and self.loss_is_scaled_for_ga is not None:
+            self.model_accepts_loss_kwargs = False
+            if self.loss_is_scaled_for_ga:
+                self.compute_loss_func = "non-None value to disable scaling"
+        self._send_telemetry()
+
+    def _send_telemetry(self):
+        # Only send from rank 0 to avoid multiplying pings by world size, and skip CI runs so automated tests don't
+        # bias the data. Honors `HF_HUB_DISABLE_TELEMETRY=1` and `HF_HUB_OFFLINE=1` (handled by `send_telemetry`).
+        if not self.accelerator.is_main_process or os.environ.get("CI"):
+            return
+        if self.is_deepspeed_enabled:
+            distributed = "deepspeed"
+        elif self.is_fsdp_enabled:
+            distributed = "fsdp"
+        elif self.accelerator.num_processes > 1:
+            distributed = "ddp"
+        else:
+            distributed = "none"
+        device = self.accelerator.device.type
+        if device == "cuda":
+            gpu = torch.cuda.get_device_name(0)
+        elif device == "xpu":
+            gpu = torch.xpu.get_device_name(0)
+        elif device == "npu":
+            gpu = torch.npu.get_device_name(0)
+        elif device == "mlu":
+            gpu = torch.mlu.get_device_name(0)
+        elif device == "neuron":
+            gpu = torch.neuron.get_device_properties(0).name
+        else:
+            gpu = "other"
+        # Bucketed to avoid fingerprinting individual deployments by their exact cluster size.
+        n = self.accelerator.num_processes
+        world_size = "1" if n == 1 else "2-8" if n <= 8 else "9-64" if n <= 64 else "65+"
+        # Trainer class and model arch are reported only if they come from a known upstream allowlist (TRL trainers,
+        # transformers `CONFIG_MAPPING`); anything else is reported as "other" so we never leak the names of internal,
+        # custom trainer subclasses or private model architectures.
+        cls = type(self)
+        if cls.__name__ in _TELEMETRY_TRAINERS and cls.__module__.startswith("trl."):
+            trainer = cls.__name__
+        else:
+            trainer = _TELEMETRY_TRAINER_NAMES.get(self._name, "other")
+        # How the data was loaded, never what it is. Hub downloads cache under `<cache>/<namespace>___<name>/`, while
+        # file-based builders land in `<cache>/<builder>/default-<hash>/`. A Hub repo of raw json/csv files also goes
+        # through a file-based builder, hence "files" rather than "local".
+        if not isinstance(self.train_dataset, Dataset):
+            dataset_source = "other"  # IterableDataset, torch Dataset, or no training dataset
+        elif not self.train_dataset.cache_files:
+            dataset_source = "memory"  # e.g. `Dataset.from_dict`
+        elif any("___" in part for part in Path(self.train_dataset.cache_files[0]["filename"]).parts):
+            dataset_source = "hub"
+        else:
+            dataset_source = "files"
+        model_type = self.model.config.model_type
+        model_arch = model_type if model_type in CONFIG_MAPPING else "other"
+        send_telemetry(
+            topic=f"trl/{trainer}",
+            library_name="trl",
+            library_version=__version__,
+            user_agent={
+                "model_arch": model_arch,
+                "peft": str(is_peft_model(self.model)).lower(),
+                "dataset_source": dataset_source,
+                "distributed": distributed,
+                "world_size": world_size,
+                "device": device,
+                "gpu": gpu,
+            },
+        )
 
     def create_model_card(
         self,
@@ -43,7 +184,7 @@ class _BaseTrainer(Trainer):
                 Name of the model.
             dataset_name (`str`, *optional*):
                 Name of the dataset used for training.
-            tags (`str`, `list[str]`, *optional*):
+            tags (`str` or `list[str]`, *optional*):
                 Tags to be associated with the model card.
         """
         if not self.is_world_process_zero():

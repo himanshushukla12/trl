@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+
 import pytest
 import torch
 import transformers
-from datasets import load_dataset
+from datasets import Dataset, DatasetDict, IterableDatasetDict, load_dataset
 from packaging.version import Version
-from packaging.version import parse as parse_version
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from transformers.testing_utils import torch_device
 from transformers.utils import is_peft_available
 
@@ -28,16 +29,19 @@ from trl.trainer.dpo_trainer import DataCollatorForPreference, DataCollatorForVi
 from .testing_utils import (
     TrlTestCase,
     is_ampere_or_newer,
+    is_bf16_supported,
     require_bitsandbytes,
     require_kernels,
-    require_liger_kernel,
     require_peft,
+    require_torch_accelerator,
     require_vision,
 )
 
 
 if is_peft_available():
-    from peft import LoraConfig, get_peft_model
+    import peft
+    from peft import LoraConfig, PromptTuningConfig, get_peft_model
+    from peft.utils import TaskType
 
 
 class TestDataCollatorForPreference(TrlTestCase):
@@ -169,13 +173,60 @@ class TestDPOTrainer(TrlTestCase):
     @pytest.mark.parametrize(
         "model_id",
         [
+            "trl-internal-testing/tiny-Cohere2ForCausalLM",
+            pytest.param(
+                "trl-internal-testing/tiny-Glm4MoeForCausalLM",
+                marks=pytest.mark.skipif(
+                    Version(transformers.__version__) < Version("5.0.0"),
+                    reason="GLM4 tokenizer requires transformers>=5.0.0",
+                ),
+            ),
+            "trl-internal-testing/tiny-GptOssForCausalLM",
+            "trl-internal-testing/tiny-GraniteMoeForCausalLM",
+            "trl-internal-testing/tiny-GraniteMoeHybridForCausalLM",
+            "trl-internal-testing/tiny-PhimoeForCausalLM",
             "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
             "trl-internal-testing/tiny-Qwen3MoeForCausalLM",
-            "trl-internal-testing/tiny-GptOssForCausalLM",
+            pytest.param(
+                "trl-internal-testing/tiny-BeamForCausalLM",
+                marks=pytest.mark.skipif(
+                    Version(transformers.__version__) < Version("5.20.1"),
+                    reason="Beam was introduced in transformers-5.20.1",
+                ),
+            ),
+            pytest.param(
+                "trl-internal-testing/tiny-NemotronHForCausalLM-nano",
+                marks=pytest.mark.skipif(
+                    Version(transformers.__version__) < Version("5.7.0"),
+                    reason="Nemotron 3 gradient checkpointing requires transformers>=5.7.0 (see transformers#45625)",
+                ),
+            ),
+            pytest.param(
+                "trl-internal-testing/tiny-Olmo3ForCausalLM",
+                marks=pytest.mark.skipif(
+                    Version(transformers.__version__) < Version("4.57.0"),
+                    reason="Olmo 3 requires transformers>=4.57.0",
+                ),
+            ),
+            "trl-internal-testing/tiny-Lfm2ForCausalLM",
+            pytest.param(
+                "trl-internal-testing/tiny-Lfm2ForCausalLM-2.5",
+                marks=pytest.mark.skipif(
+                    Version(transformers.__version__) < Version("5.0.0"),
+                    reason="LFM2.5 tokenizer requires transformers>=5.0.0",
+                ),
+            ),
+            pytest.param(
+                "trl-internal-testing/tiny-Lfm2MoeForCausalLM-2.5",
+                marks=pytest.mark.skipif(
+                    Version(transformers.__version__) < Version("5.0.0"),
+                    reason="LFM2-MoE requires transformers>=5.0.0",
+                ),
+            ),
         ],
     )
     def test_train(self, model_id):
-        dataset = load_dataset("trl-internal-testing/zen", "standard_preference", split="train")
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
 
         training_args = DPOConfig(
             output_dir=self.tmp_dir,
@@ -183,6 +234,182 @@ class TestDPOTrainer(TrlTestCase):
             report_to="none",
         )
         trainer = DPOTrainer(model=model_id, args=training_args, train_dataset=dataset)
+
+        previous_trainable_params = {n: param.clone() for n, param in trainer.model.named_parameters()}
+
+        trainer.train()
+
+        assert trainer.state.log_history[-1]["train_loss"] is not None
+
+        # MoE models log the load-balancing auxiliary loss (on by default)
+        if trainer.aux_loss_enabled:
+            assert trainer.state.log_history[-1]["aux_loss"] is not None
+
+        # Check that the params have changed
+        for n, param in previous_trainable_params.items():
+            new_param = trainer.model.get_parameter(n)
+            assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
+
+    def test_saved_model_keeps_its_router_config(self):
+        # Regression test for https://github.com/huggingface/trl/issues/8102
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
+        training_args = DPOConfig(
+            output_dir=self.tmp_dir,
+            router_aux_loss_coef=0.5,
+            max_steps=1,  # running the training loop once is enough
+            logging_steps=1,
+            report_to="none",
+        )
+        trainer = DPOTrainer(
+            model="trl-internal-testing/tiny-Qwen3MoeForCausalLM", args=training_args, train_dataset=dataset
+        )
+        trainer.train()
+        trainer.save_model()
+
+        # Trained with another aux loss coef, saved with the router config it was loaded with
+        assert "aux_loss" in trainer.state.log_history[0]
+        config = AutoConfig.from_pretrained(self.tmp_dir)
+        assert config.output_router_logits is False
+        assert config.router_aux_loss_coef == 0.001
+
+    @pytest.mark.parametrize("precompute_ref_log_probs", [False, True])
+    @pytest.mark.parametrize(
+        "eval_dataset_type",
+        [
+            "dataset",
+            "iterable_dataset",
+            "dataset_dict",
+            "iterable_dataset_dict",
+            "dict_of_dataset",
+            "dict_of_iterable_dataset",
+        ],
+    )
+    def test_evaluate_with_eval_dataset(self, eval_dataset_type, precompute_ref_log_probs):
+        # `evaluate` accepts a raw (unprepared) dataset passed directly, not only a preprocessed `eval_dataset` set
+        # at init. See https://github.com/huggingface/trl/issues/6115.
+        train_dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
+        streaming = "iterable" in eval_dataset_type
+        eval_split = load_dataset(
+            "trl-internal-testing/zen", "conversational_preference", split="test", streaming=streaming
+        )
+        if eval_dataset_type in ("dataset", "iterable_dataset"):
+            eval_dataset = eval_split
+        elif eval_dataset_type in ("dataset_dict", "iterable_dataset_dict"):
+            dataset_dict_cls = IterableDatasetDict if streaming else DatasetDict
+            eval_dataset = dataset_dict_cls({"data1": eval_split, "data2": eval_split})
+        else:  # "dict_of_dataset" or "dict_of_iterable_dataset"
+            eval_dataset = {"data1": eval_split, "data2": eval_split}
+
+        training_args = DPOConfig(
+            output_dir=self.tmp_dir, precompute_ref_log_probs=precompute_ref_log_probs, report_to="none"
+        )
+        trainer = DPOTrainer(
+            model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5", args=training_args, train_dataset=train_dataset
+        )
+
+        if streaming and precompute_ref_log_probs:
+            with pytest.raises(ValueError, match="precompute_ref_log_probs.*not supported with IterableDataset"):
+                trainer.evaluate(eval_dataset=eval_dataset)
+            return
+
+        metrics = trainer.evaluate(eval_dataset=eval_dataset)
+        if eval_dataset_type in ("dataset", "iterable_dataset"):
+            assert metrics["eval_loss"] is not None
+        else:
+            assert metrics["eval_data1_loss"] is not None
+            assert metrics["eval_data2_loss"] is not None
+
+    def test_evaluate_precompute_ref_log_probs_after_training_raises(self):
+        # Full fine-tuning with `precompute_ref_log_probs=True` and no `ref_model` uses `self.model` as the reference.
+        # That's valid only before training; a dataset passed to `evaluate()` afterwards can't get a correct reference.
+        train_dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
+        eval_dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="test")
+        training_args = DPOConfig(
+            output_dir=self.tmp_dir, max_steps=1, precompute_ref_log_probs=True, report_to="none"
+        )
+        trainer = DPOTrainer(
+            model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5", args=training_args, train_dataset=train_dataset
+        )
+
+        # Before training the reference is available, so evaluating a new dataset works.
+        assert trainer.evaluate(eval_dataset=eval_dataset)["eval_loss"] is not None
+
+        trainer.train()
+
+        with pytest.raises(ValueError, match="Cannot compute reference log-probs for a dataset passed to"):
+            trainer.evaluate(eval_dataset=eval_dataset)
+
+    @pytest.mark.parametrize("eval_dataset_type", ["dataset", "dataset_dict", "dict_of_dataset"])
+    def test_evaluate_precompute_ref_log_probs_at_init_after_training(self, eval_dataset_type):
+        # Regression for the guard above: an `eval_dataset` set at init has its reference log-probs precomputed once
+        # (against the untrained reference) and stored, so no-arg `evaluate()` reuses those stored values and must not
+        # raise after training, even with full fine-tuning and `precompute_ref_log_probs=True`.
+        train_dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
+        eval_split = load_dataset("trl-internal-testing/zen", "conversational_preference", split="test")
+        if eval_dataset_type == "dataset":
+            eval_dataset = eval_split
+        elif eval_dataset_type == "dataset_dict":
+            eval_dataset = DatasetDict({"data1": eval_split, "data2": eval_split})
+        else:  # "dict_of_dataset"
+            eval_dataset = {"data1": eval_split, "data2": eval_split}
+
+        training_args = DPOConfig(
+            output_dir=self.tmp_dir, max_steps=1, precompute_ref_log_probs=True, report_to="none"
+        )
+        trainer = DPOTrainer(
+            model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
+            args=training_args,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+        )
+
+        trainer.train()
+
+        metrics = trainer.evaluate()
+        if eval_dataset_type == "dataset":
+            assert metrics["eval_loss"] is not None
+        else:
+            assert metrics["eval_data1_loss"] is not None
+            assert metrics["eval_data2_loss"] is not None
+
+    def test_trust_remote_code(self):
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
+        model_id = "trl-internal-testing/tiny-RemoteForCausalLM"
+
+        with pytest.raises(ValueError, match="custom code"):
+            DPOTrainer(
+                model=model_id,
+                args=DPOConfig(output_dir=self.tmp_dir, report_to="none"),
+                train_dataset=dataset,
+            )
+
+        trainer = DPOTrainer(
+            model=model_id,
+            args=DPOConfig(output_dir=self.tmp_dir, report_to="none", trust_remote_code=True),
+            train_dataset=dataset,
+        )
+        assert type(trainer.model).__name__ == "RemoteForCausalLM"
+
+    @pytest.mark.parametrize(
+        "config_name",
+        [
+            "standard_preference",
+            "conversational_preference",
+            "standard_implicit_prompt_preference",
+            "conversational_implicit_prompt_preference",
+        ],
+    )
+    def test_train_dataset_format(self, config_name):
+        dataset = load_dataset("trl-internal-testing/zen", config_name, split="train")
+
+        training_args = DPOConfig(
+            output_dir=self.tmp_dir,
+            learning_rate=0.1,  # use higher lr because gradients are tiny and default lr can stall updates
+            report_to="none",
+        )
+        trainer = DPOTrainer(
+            model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5", args=training_args, train_dataset=dataset
+        )
 
         previous_trainable_params = {n: param.clone() for n, param in trainer.model.named_parameters()}
 
@@ -219,13 +446,32 @@ class TestDPOTrainer(TrlTestCase):
             new_param = trainer.model.get_parameter(n)
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
-    def test_train_model(self):
-        model = AutoModelForCausalLM.from_pretrained(
+    @pytest.mark.parametrize(
+        "model_id",
+        [
             "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
-            dtype="float32",
-        )
+            # Loaded with `AutoModelForCausalLM`, a Qwen3.5 checkpoint gives its language model alone
+            # (`Qwen3_5ForCausalLM`, model type `qwen3_5_text`), which is how Qwen3.5 is usually trained on text
+            pytest.param(
+                "trl-internal-testing/tiny-Qwen3_5ForConditionalGeneration-NoThink",
+                marks=pytest.mark.skipif(
+                    Version(transformers.__version__) < Version("5.2.0"),
+                    reason="Qwen3.5 models were introduced in transformers-5.2.0",
+                ),
+            ),
+            pytest.param(
+                "trl-internal-testing/tiny-Qwen3_5MoeForConditionalGeneration-3.6",
+                marks=pytest.mark.skipif(
+                    Version(transformers.__version__) < Version("5.2.0"),
+                    reason="Qwen3.5 models were introduced in transformers-5.2.0",
+                ),
+            ),
+        ],
+    )
+    def test_train_model(self, model_id):
+        model = AutoModelForCausalLM.from_pretrained(model_id, dtype="float32")
 
-        dataset = load_dataset("trl-internal-testing/zen", "standard_preference", split="train")
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
 
         training_args = DPOConfig(
             output_dir=self.tmp_dir,
@@ -263,15 +509,16 @@ class TestDPOTrainer(TrlTestCase):
             "discopop",
             "sft",
             "sigmoid_norm",
+            "udpo",
         ],
     )
     def test_train_loss_types(self, loss_type):
-        dataset = load_dataset("trl-internal-testing/zen", "standard_preference")
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_preference")
 
         training_args = DPOConfig(
             output_dir=self.tmp_dir,
             loss_type=loss_type,
-            label_smoothing=1e-3 if loss_type == "exo_pair" else 0.0,
+            label_smoothing={"exo_pair": 1e-3, "udpo": 0.2}.get(loss_type, 0.0),
             learning_rate=0.1,  # use higher lr because gradients are tiny and default lr can stall updates
             report_to="none",
             eval_strategy="steps",
@@ -295,8 +542,49 @@ class TestDPOTrainer(TrlTestCase):
             new_param = trainer.model.get_parameter(n)
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
+    def test_udpo_loss_value(self):
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_preference")
+
+        training_args = DPOConfig(
+            output_dir=self.tmp_dir,
+            loss_type="udpo",
+            label_smoothing=0.2,
+            learning_rate=0.1,  # move the policy away from the reference model, so that the reward margin is non-zero
+            report_to="none",
+        )
+        trainer = DPOTrainer(
+            model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
+            args=training_args,
+            train_dataset=dataset["train"],
+            eval_dataset=dataset["test"].select(range(1)),
+        )
+        trainer.train()
+        metrics = trainer.evaluate()
+
+        # With a single eval example, the eval loss is the normalized UDPO loss -α·log((e^z + a) / (e^z + 1)) at the
+        # logged reward margin z, with a = ε / (1 - ε) and α = (1 + √a) / (1 - √a). The log is written as
+        # log(1 - (1 - a) / (e^z + 1)) for precision.
+        z = metrics["eval_rewards/margins"]
+        a = 0.2 / (1 - 0.2)
+        alpha = (1 + math.sqrt(a)) / (1 - math.sqrt(a))
+        assert z != 0.0
+        assert metrics["eval_loss"] == pytest.approx(-alpha * math.log1p(-(1 - a) / (math.exp(z) + 1)), rel=1e-4)
+
+    def test_udpo_label_smoothing_out_of_range_raises(self):
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
+
+        # `label_smoothing` is the flip probability ε, not the paper's a = ε / (1 - ε), so a = 0.8 passed as is fails
+        training_args = DPOConfig(output_dir=self.tmp_dir, loss_type="udpo", label_smoothing=0.8, report_to="none")
+
+        with pytest.raises(ValueError, match=r"must lie in \[0.0, 0.5\) for the 'udpo' loss"):
+            DPOTrainer(
+                model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
+                args=training_args,
+                train_dataset=dataset,
+            )
+
     def test_train_multi_loss_types(self):
-        dataset = load_dataset("trl-internal-testing/zen", "standard_preference", split="train")
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
 
         training_args = DPOConfig(
             output_dir=self.tmp_dir,
@@ -322,7 +610,7 @@ class TestDPOTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_train_with_wpo(self):
-        dataset = load_dataset("trl-internal-testing/zen", "standard_preference", split="train")
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
 
         training_args = DPOConfig(
             output_dir=self.tmp_dir,
@@ -347,8 +635,37 @@ class TestDPOTrainer(TrlTestCase):
             new_param = trainer.model.get_parameter(n)
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
+    def test_train_with_wpo_sft(self):
+        # The "sft" loss is a scalar expanded to the batch size, so the WPO weighting must not multiply it in place.
+        # See https://github.com/huggingface/trl/issues/7630.
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
+
+        training_args = DPOConfig(
+            output_dir=self.tmp_dir,
+            learning_rate=0.1,  # use higher lr because gradients are tiny and default lr can stall updates
+            loss_type=["sigmoid", "sft"],
+            report_to="none",
+            use_weighting=True,
+        )
+        trainer = DPOTrainer(
+            model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
+            args=training_args,
+            train_dataset=dataset,
+        )
+
+        previous_trainable_params = {n: param.clone() for n, param in trainer.model.named_parameters()}
+
+        trainer.train()
+
+        assert trainer.state.log_history[-1]["train_loss"] is not None
+
+        # Check that the params have changed
+        for n, param in previous_trainable_params.items():
+            new_param = trainer.model.get_parameter(n)
+            assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
+
     def test_train_with_ld(self):
-        dataset = load_dataset("trl-internal-testing/zen", "standard_preference", split="train")
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
 
         training_args = DPOConfig(
             output_dir=self.tmp_dir,
@@ -378,7 +695,7 @@ class TestDPOTrainer(TrlTestCase):
         ["reverse_kl", "forward_kl", "js_divergence", "alpha_divergence"],
     )
     def test_train_with_f_divergence(self, f_divergence_type):
-        dataset = load_dataset("trl-internal-testing/zen", "standard_preference", split="train")
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
 
         training_args = DPOConfig(
             output_dir=self.tmp_dir,
@@ -403,8 +720,27 @@ class TestDPOTrainer(TrlTestCase):
             new_param = trainer.model.get_parameter(n)
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
+    @pytest.mark.parametrize("loss_type", ["apo_zero", "apo_down", "aot", "aot_unpaired", "nca_pair", "sppo_hard"])
+    def test_init_fails_with_f_divergence_and_unsupported_loss(self, loss_type):
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
+
+        # These losses are not built on the chosen-rejected reward difference, so a non-default value is rejected.
+        training_args = DPOConfig(
+            output_dir=self.tmp_dir,
+            loss_type=loss_type,
+            f_divergence_type="js_divergence",
+            report_to="none",
+        )
+
+        with pytest.raises(ValueError, match="is only supported for the following loss types"):
+            DPOTrainer(
+                model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
+                args=training_args,
+                train_dataset=dataset,
+            )
+
     def test_train_with_explicit_ref_model(self):
-        dataset = load_dataset("trl-internal-testing/zen", "standard_preference", split="train")
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
 
         training_args = DPOConfig(
             output_dir=self.tmp_dir,
@@ -437,7 +773,7 @@ class TestDPOTrainer(TrlTestCase):
             torch.testing.assert_close(param, new_ref_param, msg=f"Reference model parameter {n} has changed.")
 
     def test_train_with_sync_ref_model(self):
-        dataset = load_dataset("trl-internal-testing/zen", "standard_preference", split="train")
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
 
         training_args = DPOConfig(
             output_dir=self.tmp_dir,
@@ -465,8 +801,20 @@ class TestDPOTrainer(TrlTestCase):
             new_ref_param = trainer.ref_model.get_parameter(n)
             assert not torch.equal(previous_ref_params[n], new_ref_param), f"Ref Parameter {n} has not changed."
 
+    def test_ref_model_like_model_instance(self):
+        # A policy passed as an instance has no `model_init_kwargs`: the reference is built with its dtype and attention
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
+        model = AutoModelForCausalLM.from_pretrained(
+            "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5", dtype=torch.bfloat16, attn_implementation="eager"
+        )
+        training_args = DPOConfig(output_dir=self.tmp_dir, report_to="none")
+        trainer = DPOTrainer(model=model, args=training_args, train_dataset=dataset)
+
+        assert trainer.ref_model.dtype == torch.bfloat16
+        assert trainer.ref_model.config._attn_implementation == "eager"
+
     def test_train_model_dtype(self):
-        dataset = load_dataset("trl-internal-testing/zen", "standard_preference", split="train")
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
 
         training_args = DPOConfig(
             output_dir=self.tmp_dir,
@@ -496,12 +844,31 @@ class TestDPOTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     @require_peft
+    def test_peft_init_is_seeded(self):
+        # Two trainers with the same seed start from the same adapter weights
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
+        adapters = []
+        for global_seed in range(2):
+            torch.manual_seed(global_seed)  # a different global RNG state, as in two separate runs
+            trainer = DPOTrainer(
+                model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
+                args=DPOConfig(output_dir=self.tmp_dir, report_to="none"),
+                train_dataset=dataset,
+                peft_config=LoraConfig(),
+            )
+            adapters.append({n: p.clone() for n, p in trainer.model.named_parameters() if "lora_A" in n})
+
+        assert adapters[0]
+        for n, param in adapters[0].items():
+            assert torch.equal(param, adapters[1][n]), f"Parameter {n} differs between the two trainers."
+
+    @require_peft
     def test_train_dense_with_peft_config_lora(self):
         model_id = "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5"
         model = AutoModelForCausalLM.from_pretrained(model_id, dtype="float32")
         base_param_names = [f"base_model.model.{n}" for n, _ in model.named_parameters()]
 
-        dataset = load_dataset("trl-internal-testing/zen", "standard_preference", split="train")
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
 
         training_args = DPOConfig(
             output_dir=self.tmp_dir,
@@ -530,13 +897,17 @@ class TestDPOTrainer(TrlTestCase):
             elif "base_layer" not in n:  # We expect the peft params to be different (except for the base layer)
                 assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
+    @pytest.mark.skipif(
+        Version(transformers.__version__) < Version("5.0.0"),
+        reason="Qwen3-MoE experts are fused parameters since transformers-5.0.0",
+    )
     @require_peft
     def test_train_moe_with_peft_config(self):
-        model_id = "trl-internal-testing/tiny-GptOssForCausalLM"
+        model_id = "trl-internal-testing/tiny-Qwen3MoeForCausalLM"
         model = AutoModelForCausalLM.from_pretrained(model_id, dtype="float32")
         base_param_names = [f"base_model.model.{n}" for n, _ in model.named_parameters()]
 
-        dataset = load_dataset("trl-internal-testing/zen", "standard_preference", split="train")
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
 
         training_args = DPOConfig(
             output_dir=self.tmp_dir,
@@ -575,7 +946,7 @@ class TestDPOTrainer(TrlTestCase):
         lora_config = LoraConfig()
         model = get_peft_model(model, lora_config)
 
-        dataset = load_dataset("trl-internal-testing/zen", "standard_preference", split="train")
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
 
         training_args = DPOConfig(
             output_dir=self.tmp_dir,
@@ -583,6 +954,50 @@ class TestDPOTrainer(TrlTestCase):
             report_to="none",
         )
         trainer = DPOTrainer(model=model, args=training_args, train_dataset=dataset)
+
+        previous_trainable_params = {n: param.clone() for n, param in trainer.model.named_parameters()}
+
+        trainer.train()
+
+        assert trainer.state.log_history[-1]["train_loss"] is not None
+
+        # Check that the peft params have changed and the base model params have not changed
+        for n, param in previous_trainable_params.items():
+            new_param = trainer.model.get_parameter(n)
+            if n in base_param_names:  # We expect the base model params to be the same
+                torch.testing.assert_close(param, new_param, msg=f"Parameter {n} has changed.")
+            elif "base_layer" not in n and "ref" not in n:  # and the peft params to be different (except base and ref)
+                assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
+
+    @pytest.mark.skipif(
+        Version(transformers.__version__) < Version("5.0.0"),
+        reason="Qwen3-MoE experts are fused parameters since transformers-5.0.0",
+    )
+    @require_peft
+    def test_train_moe_peft_model(self):
+        # Regression test for https://github.com/huggingface/trl/issues/5222. Before PEFT 0.20.0, only one adapter per
+        # model was supported when the LoRA config uses `target_parameters` (see peft#3340, fixed in peft#3350), so no
+        # "ref" adapter could be created and the reference log probs were computed with adapters disabled instead.
+        model_id = "trl-internal-testing/tiny-Qwen3MoeForCausalLM"
+        model = AutoModelForCausalLM.from_pretrained(model_id, dtype="float32")
+        base_param_names = [f"base_model.model.{n}" for n, _ in model.named_parameters()]
+
+        lora_config = LoraConfig(target_parameters=["mlp.experts.down_proj", "mlp.experts.gate_up_proj"])
+        model = get_peft_model(model, lora_config)
+
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
+
+        training_args = DPOConfig(
+            output_dir=self.tmp_dir,
+            learning_rate=0.1,  # use higher lr because gradients are tiny and default lr can stall updates
+            report_to="none",
+        )
+        trainer = DPOTrainer(model=model, args=training_args, train_dataset=dataset)
+
+        if Version(peft.__version__) < Version("0.20.0"):
+            assert "ref" not in trainer.model.peft_config
+        else:
+            assert "ref" in trainer.model.peft_config
 
         previous_trainable_params = {n: param.clone() for n, param in trainer.model.named_parameters()}
 
@@ -607,7 +1022,7 @@ class TestDPOTrainer(TrlTestCase):
         model = AutoModelForCausalLM.from_pretrained(model_id, dtype="float32")
         base_param_names = [f"base_model.model.{n}" for n, _ in model.named_parameters()]
 
-        dataset = load_dataset("trl-internal-testing/zen", "standard_preference", split="train")
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
 
         training_args = DPOConfig(
             output_dir=self.tmp_dir,
@@ -637,52 +1052,150 @@ class TestDPOTrainer(TrlTestCase):
             elif "base_layer" not in n:  # We expect the peft params to be different (except for the base layer)
                 assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
-    @require_liger_kernel
-    def test_train_with_liger(self):
-        dataset = load_dataset("trl-internal-testing/zen", "standard_preference", split="train")
-
+    @pytest.mark.skipif(not is_bf16_supported(), reason="test requires bf16 support")
+    def test_ref_logps_use_mixed_precision(self):
+        # Reference precomputation runs outside `compute_loss`, so it has to enter autocast itself. Without that the
+        # backbone would silently run in fp32 under bf16 training.
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
         training_args = DPOConfig(
             output_dir=self.tmp_dir,
-            learning_rate=0.1,  # use higher lr because gradients are tiny and default lr can stall updates
-            use_liger_kernel=True,
+            bf16=True,
+            per_device_train_batch_size=2,
+            report_to="none",
+        )
+        trainer = DPOTrainer(
+            model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5", args=training_args, train_dataset=dataset
+        )
+        inputs = trainer._prepare_inputs(next(iter(trainer.get_train_dataloader())))
+        projection = next(module for name, module in trainer.model.named_modules() if name.endswith("q_proj"))
+        projection_dtypes = []
+
+        def record_projection_dtype(_module, _args, output):
+            projection_dtypes.append(output.dtype)
+
+        with projection.register_forward_hook(record_projection_dtype):
+            ref_chosen_logps, ref_rejected_logps = trainer.compute_ref_log_probs(trainer.model, inputs)
+
+        assert projection_dtypes == [torch.bfloat16]
+        assert torch.isfinite(ref_chosen_logps).all() and torch.isfinite(ref_rejected_logps).all()
+
+    def test_train_with_precomputed_ref_logps(self):
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
+        training_args = DPOConfig(
+            output_dir=self.tmp_dir,
+            per_device_train_batch_size=2,
+            max_steps=1,
+            precompute_ref_log_probs=True,
             report_to="none",
         )
         trainer = DPOTrainer(
             model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5", args=training_args, train_dataset=dataset
         )
 
+        trainer.train()
+
+        assert trainer.state.log_history[-1]["train_loss"] is not None
+
+    @require_peft
+    def test_peft_lm_head_raises(self):
+        # The chunked projection reads `lm_head.weight` directly, so a LoRA adapter on `lm_head` is silently
+        # ignored and never trained. The trainer must fail fast instead of training a silently-frozen head.
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
+        training_args = DPOConfig(output_dir=self.tmp_dir, report_to="none")
+        # `ensure_weight_tying=True` silences PEFT's weight-tying warning fired when lm_head is in the adapter on a
+        # model with untied embeddings; once tying respects `tie_word_embeddings`, the flag itself warns that no tied
+        # modules were found, so it must only be set on the affected range.
+        # - Introduced in PEFT 0.19.0 (peft#2879); fixed on main, unreleased as of 0.19.2.dev0 (peft#3171)
+        needs_ensure_weight_tying = Version("0.19.0") <= Version(peft.__version__) < Version("0.19.2.dev0")
+        lora_config = LoraConfig(
+            target_modules=["q_proj", "v_proj", "lm_head"],
+            **({"ensure_weight_tying": True} if needs_ensure_weight_tying else {}),
+        )
+        with pytest.raises(ValueError, match="lm_head"):
+            DPOTrainer(
+                model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
+                args=training_args,
+                train_dataset=dataset,
+                peft_config=lora_config,
+            )
+
+    @require_peft
+    def test_peft_ref_model_raises(self):
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
+        training_args = DPOConfig(output_dir=self.tmp_dir, report_to="none")
+        ref_model = AutoModelForCausalLM.from_pretrained(
+            "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5", dtype="float32"
+        )
+        ref_model = get_peft_model(ref_model, LoraConfig())
+        with pytest.raises(ValueError, match="`ref_model` cannot be a `PeftModel`"):
+            DPOTrainer(
+                model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
+                ref_model=ref_model,
+                args=training_args,
+                train_dataset=dataset,
+            )
+
+    @require_peft
+    def test_train_peft_prompt_tuning(self):
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
+        training_args = DPOConfig(
+            output_dir=self.tmp_dir,
+            learning_rate=0.1,  # use higher lr because gradients are tiny and default lr can stall updates
+            report_to="none",
+        )
+        trainer = DPOTrainer(
+            model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
+            args=training_args,
+            train_dataset=dataset,
+            peft_config=PromptTuningConfig(task_type=TaskType.CAUSAL_LM, num_virtual_tokens=8),
+        )
         previous_trainable_params = {n: param.clone() for n, param in trainer.model.named_parameters()}
 
         trainer.train()
 
         assert trainer.state.log_history[-1]["train_loss"] is not None
 
-        # Check that the params have changed
+        # Check that the prompt embeddings have changed
         for n, param in previous_trainable_params.items():
             new_param = trainer.model.get_parameter(n)
-            assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
+            if "prompt_encoder" in n:
+                assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
-    @require_liger_kernel
-    @require_peft
-    def test_init_fails_with_peft_and_liger(self):
-        dataset = load_dataset("trl-internal-testing/zen", "standard_preference", split="train")
-
-        training_args = DPOConfig(
-            output_dir=self.tmp_dir,
-            use_liger_kernel=True,
-            report_to="none",
+    @pytest.mark.parametrize("iterable_as", ["train", "eval", "eval_dict", "eval_iterable_dataset_dict"])
+    def test_precompute_ref_log_probs_raises_for_iterable_dataset(self, iterable_as):
+        # `precompute_ref_log_probs=True` caches reference log-probs by index, which requires random access and is
+        # therefore incompatible with a streaming `IterableDataset` — whether passed directly or nested in a dict or
+        # `IterableDatasetDict` as the eval dataset.
+        map_dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
+        iterable_dataset = load_dataset(
+            "trl-internal-testing/zen", "conversational_preference", split="train", streaming=True
         )
 
-        with pytest.raises(NotImplementedError, match="Liger DPO loss is not implemented for PEFT models."):
+        train_dataset, eval_dataset = map_dataset, None
+        if iterable_as == "train":
+            train_dataset = iterable_dataset
+        elif iterable_as == "eval":
+            eval_dataset = iterable_dataset
+        elif iterable_as == "eval_dict":
+            eval_dataset = {"eval": iterable_dataset}
+        elif iterable_as == "eval_iterable_dataset_dict":
+            eval_dataset = IterableDatasetDict({"eval": iterable_dataset})
+
+        # `max_steps` lets the iterable-train case reach the precompute check instead of failing earlier on the
+        # missing dataset length required by the learning-rate scheduler.
+        training_args = DPOConfig(
+            output_dir=self.tmp_dir, max_steps=1, report_to="none", precompute_ref_log_probs=True
+        )
+        with pytest.raises(ValueError, match="precompute_ref_log_probs.*not supported with IterableDataset"):
             DPOTrainer(
                 model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
                 args=training_args,
-                train_dataset=dataset,
-                peft_config=LoraConfig(),
+                train_dataset=train_dataset,
+                eval_dataset=eval_dataset,
             )
 
     def test_train_with_iterable_dataset(self):
-        dataset = load_dataset("trl-internal-testing/zen", "standard_preference", split="train", streaming=True)
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train", streaming=True)
 
         training_args = DPOConfig(
             output_dir=self.tmp_dir,
@@ -707,22 +1220,26 @@ class TestDPOTrainer(TrlTestCase):
 
     @require_kernels
     @pytest.mark.skipif(
-        not is_ampere_or_newer() and torch_device != "xpu",
-        reason="Flash attention 2 requires Ampere or newer GPU, or XPU",
+        not is_ampere_or_newer() and torch_device != "xpu" and torch.version.hip is None,
+        reason="Flash Attention requires Ampere or newer GPU, XPU, or ROCm",
     )
     def test_train_padding_free(self):
-        dataset = load_dataset("trl-internal-testing/zen", "standard_preference", split="train")
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
 
         training_args = DPOConfig(
             output_dir=self.tmp_dir,
             learning_rate=0.1,  # use higher lr because gradients are tiny and default lr can stall updates
             padding_free=True,
-            model_init_kwargs={"attn_implementation": "kernels-community/flash-attn2"},
+            model_init_kwargs={
+                "attn_implementation": (
+                    "kernels-community/aiter-flash-attn@v2" if torch.version.hip else "kernels-community/flash-attn2"
+                )
+            },
             bf16=True,  # flash_attention_2 only supports bf16 and fp16
             report_to="none",
         )
         trainer = DPOTrainer(
-            model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5", args=training_args, train_dataset=dataset
+            model="trl-internal-testing/tiny-Qwen3ForCausalLM", args=training_args, train_dataset=dataset
         )
 
         previous_trainable_params = {n: param.clone() for n, param in trainer.model.named_parameters()}
@@ -735,6 +1252,27 @@ class TestDPOTrainer(TrlTestCase):
         for n, param in previous_trainable_params.items():
             new_param = trainer.model.get_parameter(n)
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
+
+    @pytest.mark.skipif(
+        Version(transformers.__version__) < Version("4.57.0"), reason="Olmo 3 requires transformers>=4.57.0"
+    )
+    def test_tokenize_prompt_not_prefix_of_conversation(self):
+        # The Olmo-3 Think template ends the generation prompt with `<think>`, which the full conversation doesn't
+        # have, so the tokenized prompt is not a prefix of the tokenized prompt+completion
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
+
+        training_args = DPOConfig(output_dir=self.tmp_dir, report_to="none")
+        trainer = DPOTrainer(
+            model="trl-internal-testing/tiny-Olmo3ForCausalLM",
+            args=training_args,
+            train_dataset=dataset,
+        )
+
+        # The chosen and rejected completions are the whole assistant turns
+        tokenizer = trainer.processing_class
+        for example, processed in zip(dataset, trainer.train_dataset, strict=True):
+            for key in ("chosen", "rejected"):
+                assert tokenizer.decode(processed[f"{key}_ids"]) == example[key][0]["content"] + tokenizer.eos_token
 
     def test_train_with_chat_template_kwargs(self):
         dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
@@ -783,12 +1321,39 @@ class TestDPOTrainer(TrlTestCase):
             new_param = trainer.model.get_parameter(n)
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
+    def test_fully_truncated_completion_examples_dropped(self):
+        """With `keep_start` truncation, an example whose prompt alone fills `max_length` loses every completion token
+        in the collator, so it's dropped during dataset preparation."""
+        dataset = Dataset.from_dict(
+            {
+                "prompt": ["Hi", "This is a very long prompt that fills up the whole max_length budget on its own"],
+                "chosen": [" there", " yes"],
+                "rejected": [" bye", " no"],
+            }
+        )
+
+        training_args = DPOConfig(
+            output_dir=self.tmp_dir,
+            max_length=6,
+            truncation_mode="keep_start",
+            report_to="none",
+        )
+        trainer = DPOTrainer(
+            model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5", args=training_args, train_dataset=dataset
+        )
+
+        # Only the short-prompt example survives.
+        assert len(trainer.train_dataset) == 1
+        assert trainer.train_dataset[0]["prompt_ids"] == trainer.processing_class("Hi")["input_ids"]
+
     def test_train_toolcall_data(self):
         dataset = load_dataset("trl-internal-testing/toolcall", "preference", split="train")
 
         training_args = DPOConfig(
             output_dir=self.tmp_dir,
             learning_rate=0.1,  # use higher lr because gradients are tiny and default lr can stall updates
+            per_device_train_batch_size=2,  # toolcall sequences are longer than standard data, reduce batch size to avoid OOM
+            max_length=512,  # toolcall sequences are longer than standard data, limit length to avoid OOM
             report_to="none",
         )
         trainer = DPOTrainer(
@@ -807,7 +1372,7 @@ class TestDPOTrainer(TrlTestCase):
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
     def test_train_with_eval(self):
-        dataset = load_dataset("trl-internal-testing/zen", "standard_preference")
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_preference")
 
         training_args = DPOConfig(output_dir=self.tmp_dir, eval_strategy="steps", eval_steps=3, report_to="none")
         trainer = DPOTrainer(
@@ -822,7 +1387,7 @@ class TestDPOTrainer(TrlTestCase):
         assert trainer.state.log_history[0]["eval_loss"] is not None
 
     def test_train_with_multiple_eval_dataset(self):
-        dataset = load_dataset("trl-internal-testing/zen", "standard_preference")
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_preference")
 
         training_args = DPOConfig(output_dir=self.tmp_dir, eval_strategy="steps", eval_steps=3, report_to="none")
         trainer = DPOTrainer(
@@ -836,10 +1401,96 @@ class TestDPOTrainer(TrlTestCase):
         assert trainer.state.log_history[-3]["eval_data1_loss"] is not None
         assert trainer.state.log_history[-2]["eval_data2_loss"] is not None
 
+    @pytest.mark.parametrize("train_dataset_type", ["dataset", "iterable_dataset", "none", "unsupported_dataset_dict"])
+    def test_init_with_train_dataset(self, train_dataset_type):
+        streaming = "iterable" in train_dataset_type
+        if train_dataset_type == "none":
+            train_dataset = None
+        else:
+            train_dataset = load_dataset(
+                "trl-internal-testing/zen", "conversational_preference", split="train", streaming=streaming
+            )
+            if train_dataset_type == "unsupported_dataset_dict":
+                # `DatasetDict` is representative of any unsupported type here; not exhaustive
+                train_dataset = DatasetDict({"train": train_dataset})
+
+        # Iterable (streaming) datasets have no length, so `max_steps` is required.
+        training_args = DPOConfig(output_dir=self.tmp_dir, max_steps=3 if streaming else -1, report_to="none")
+
+        if train_dataset_type == "none":
+            with pytest.raises(ValueError, match="`train_dataset` is required"):
+                DPOTrainer(
+                    model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
+                    args=training_args,
+                    train_dataset=train_dataset,
+                )
+        elif train_dataset_type == "unsupported_dataset_dict":
+            with pytest.raises(TypeError, match="`train_dataset` must be a `Dataset` or `IterableDataset`"):
+                DPOTrainer(
+                    model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
+                    args=training_args,
+                    train_dataset=train_dataset,
+                )
+        else:
+            trainer = DPOTrainer(
+                model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5", args=training_args, train_dataset=train_dataset
+            )
+            assert "prompt_ids" in next(iter(trainer.train_dataset))
+
+    @pytest.mark.parametrize(
+        "eval_dataset_type",
+        [
+            "dataset",
+            "iterable_dataset",
+            "dataset_dict",
+            "iterable_dataset_dict",
+            "dict_of_dataset",
+            "dict_of_iterable_dataset",
+            "none",
+        ],
+    )
+    def test_init_with_eval_dataset(self, eval_dataset_type):
+        train_dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
+
+        if eval_dataset_type == "none":
+            eval_dataset = None
+        else:
+            streaming = "iterable" in eval_dataset_type
+            eval_split = load_dataset(
+                "trl-internal-testing/zen", "conversational_preference", split="test", streaming=streaming
+            )
+            if eval_dataset_type in ("dataset", "iterable_dataset"):
+                eval_dataset = eval_split
+            elif eval_dataset_type in ("dataset_dict", "iterable_dataset_dict"):
+                dataset_dict_cls = IterableDatasetDict if streaming else DatasetDict
+                eval_dataset = dataset_dict_cls({"data1": eval_split, "data2": eval_split})
+            else:  # "dict_of_dataset" or "dict_of_iterable_dataset"
+                eval_dataset = {"data1": eval_split, "data2": eval_split}
+
+        training_args = DPOConfig(output_dir=self.tmp_dir, report_to="none")
+        trainer = DPOTrainer(
+            model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
+            args=training_args,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+        )
+
+        if eval_dataset_type == "none":
+            assert trainer.eval_dataset is None
+        elif isinstance(trainer.eval_dataset, dict):
+            assert set(trainer.eval_dataset.keys()) == {"data1", "data2"}
+            # Each split was tokenized independently.
+            assert "prompt_ids" in next(iter(trainer.eval_dataset["data1"]))
+            assert "prompt_ids" in next(iter(trainer.eval_dataset["data2"]))
+        else:
+            assert "prompt_ids" in next(iter(trainer.eval_dataset))
+
     def test_train_with_compute_metrics(self):
-        dataset = load_dataset("trl-internal-testing/zen", "standard_preference")
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_preference")
 
         def dummy_compute_metrics(eval_pred):
+            # The logits are the full-vocabulary logits, as before the fused LM head
+            assert eval_pred.predictions.shape[-1] == trainer.model.config.vocab_size
             return {"my_metric": 0.123}
 
         training_args = DPOConfig(
@@ -856,15 +1507,41 @@ class TestDPOTrainer(TrlTestCase):
             compute_metrics=dummy_compute_metrics,
         )
 
-        trainer.train()
+        with pytest.warns(FutureWarning, match="`return_outputs=True`"):
+            trainer.train()
 
         assert trainer.state.log_history[-2]["eval_my_metric"] == 0.123
+
+    def test_logits_metrics_match_full_logits(self):
+        # `logits/*` and `mean_token_accuracy` come from the fused LM head's kernel; check them against the full logits
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
+        training_args = DPOConfig(output_dir=self.tmp_dir, per_device_train_batch_size=4, report_to="none")
+        trainer = DPOTrainer(
+            model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5", args=training_args, train_dataset=dataset
+        )
+        trainer.model.eval()
+        inputs = trainer._prepare_inputs(next(iter(trainer.get_train_dataloader())))
+
+        with torch.no_grad():
+            trainer.compute_loss(trainer.model, inputs)
+            logits = trainer.model(input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"]).logits
+
+        logits = logits[:, :-1].float()
+        mask = inputs["completion_mask"][:, 1:].bool()
+        chosen_logits, rejected_logits = logits.chunk(2)
+        chosen_mask, rejected_mask = mask.chunk(2)
+        chosen_labels, _ = inputs["input_ids"][:, 1:].chunk(2)
+        metrics = trainer._metrics["eval"]
+        assert metrics["logits/chosen"][-1] == pytest.approx(chosen_logits[chosen_mask].mean().item(), rel=1e-4)
+        assert metrics["logits/rejected"][-1] == pytest.approx(rejected_logits[rejected_mask].mean().item(), rel=1e-4)
+        accuracy = (chosen_logits.argmax(-1) == chosen_labels)[chosen_mask].float().mean().item()
+        assert metrics["mean_token_accuracy"][-1] == pytest.approx(accuracy)
 
     # In practice, this test is the same as `test_train`, since gradient checkpointing is enabled by default in
     # `DPOTrainer`. We keep it as a regression guard: if the default ever changes, we still explicitly test gradient
     # checkpointing, which has caused issues in the past.
     def test_train_with_gradient_checkpointing(self):
-        dataset = load_dataset("trl-internal-testing/zen", "standard_preference", split="train")
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
 
         training_args = DPOConfig(
             output_dir=self.tmp_dir,
@@ -887,8 +1564,33 @@ class TestDPOTrainer(TrlTestCase):
             new_param = trainer.model.get_parameter(n)
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
 
+    @require_torch_accelerator
+    def test_train_with_fp16(self):
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
+
+        training_args = DPOConfig(
+            output_dir=self.tmp_dir,
+            learning_rate=0.1,  # use higher lr because gradients are tiny and default lr can stall updates
+            fp16=True,
+            report_to="none",
+        )
+        trainer = DPOTrainer(
+            model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5", args=training_args, train_dataset=dataset
+        )
+
+        previous_trainable_params = {n: param.clone() for n, param in trainer.model.named_parameters()}
+
+        trainer.train()
+
+        assert trainer.state.log_history[-1]["train_loss"] is not None
+
+        # Check that the params have changed
+        for n, param in previous_trainable_params.items():
+            new_param = trainer.model.get_parameter(n)
+            assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
+
     def test_tag_added(self):
-        dataset = load_dataset("trl-internal-testing/zen", "standard_preference", split="train")
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
 
         trainer = DPOTrainer(
             model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
@@ -900,7 +1602,7 @@ class TestDPOTrainer(TrlTestCase):
 
     @require_peft
     def test_tag_added_peft(self):
-        dataset = load_dataset("trl-internal-testing/zen", "standard_preference", split="train")
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
 
         trainer = DPOTrainer(
             model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
@@ -911,6 +1613,107 @@ class TestDPOTrainer(TrlTestCase):
         for tag in ["dpo", "trl"]:
             assert tag in trainer.model.model_tags
 
+    @require_peft
+    @require_bitsandbytes
+    def test_train_peft_and_quantization(self):
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
+
+        training_args = DPOConfig(output_dir=self.tmp_dir, learning_rate=0.1, report_to="none")
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+        )
+        trainer = DPOTrainer(
+            model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",  # identifier, so that the trainer quantizes it
+            args=training_args,
+            train_dataset=dataset,
+            quantization_config=quantization_config,
+            peft_config=LoraConfig(),
+        )
+
+        # Check that the trainer applied the quantization config when loading the model
+        assert trainer.model.base_model.model.is_loaded_in_4bit
+
+        previous_trainable_params = {n: param.clone() for n, param in trainer.model.named_parameters()}
+
+        trainer.train()
+
+        assert trainer.state.log_history[-1]["train_loss"] is not None
+        assert trainer.state.log_history[-1]["mean_token_accuracy"] is not None
+
+        # Check that the peft params have changed, and that they are cast to bfloat16, as recommended by the QLoRA
+        # paper. The base model params are not checked: bitsandbytes casts the biases of a Linear4bit in-place during
+        # the forward pass, so some of them change in a way that is unrelated to training.
+        for n, param in previous_trainable_params.items():
+            new_param = trainer.model.get_parameter(n)
+            if "lora" in n:  # We expect the peft params to be different
+                assert param.dtype == torch.bfloat16, f"Parameter {n} is not in bfloat16."
+                assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
+
+    @require_peft
+    @require_bitsandbytes
+    def test_train_peft_dora_and_quantization(self):
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
+
+        training_args = DPOConfig(output_dir=self.tmp_dir, learning_rate=0.1, report_to="none")
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+        )
+        trainer = DPOTrainer(
+            model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",  # identifier, so that the trainer quantizes it
+            args=training_args,
+            train_dataset=dataset,
+            quantization_config=quantization_config,
+            peft_config=LoraConfig(use_dora=True),
+        )
+
+        # Check that the trainer applied the quantization config when loading the model
+        assert trainer.model.base_model.model.is_loaded_in_4bit
+
+        previous_trainable_params = {n: param.clone() for n, param in trainer.model.named_parameters()}
+
+        trainer.train()
+
+        assert trainer.state.log_history[-1]["train_loss"] is not None
+        assert trainer.state.log_history[-1]["mean_token_accuracy"] is not None
+
+        # Check that the peft params have changed, and that they are cast to bfloat16, as recommended by the QLoRA
+        # paper. The base model params are not checked: bitsandbytes casts the biases of a Linear4bit in-place during
+        # the forward pass, so some of them change in a way that is unrelated to training.
+        for n, param in previous_trainable_params.items():
+            new_param = trainer.model.get_parameter(n)
+            # The DoRA magnitude vector is the exception: it must stay in float32, since its optimizer updates can be
+            # smaller than bfloat16 can represent, which would otherwise silently freeze it, see #7268
+            if "lora_magnitude_vector" in n:
+                assert param.dtype == torch.float32, f"Parameter {n} is not in float32."
+                assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
+            elif "lora" in n:  # We expect the peft params to be different
+                assert param.dtype == torch.bfloat16, f"Parameter {n} is not in bfloat16."
+                assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
+
+    def test_pad_token_id_synced_with_model_config(self):
+        # This model's tokenizer has no pad token, so the trainer falls back to the eos token. The model configs must
+        # follow: otherwise `Trainer` realigns them at train time and reports it as a change the user did not make.
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
+
+        training_args = DPOConfig(output_dir=self.tmp_dir, report_to="none")
+        trainer = DPOTrainer(
+            model="trl-internal-testing/tiny-MistralForCausalLM-0.2", args=training_args, train_dataset=dataset
+        )
+
+        pad_token_id = trainer.processing_class.pad_token_id
+        assert pad_token_id is not None
+        assert trainer.model.config.pad_token_id == pad_token_id
+        assert trainer.model.generation_config.pad_token_id == pad_token_id
+
+
+@require_vision
+class TestDPOTrainerVLM(TrlTestCase):
     @pytest.mark.parametrize(
         "model_id",
         [
@@ -924,8 +1727,22 @@ class TestDPOTrainer(TrlTestCase):
             ),
             # "trl-internal-testing/tiny-Idefics2ForConditionalGeneration",  high memory peak, skipped for now
             # "trl-internal-testing/tiny-Idefics3ForConditionalGeneration",  high memory peak, skipped for now
+            pytest.param(
+                "trl-internal-testing/tiny-Lfm2VlForConditionalGeneration-2.5",
+                marks=pytest.mark.skipif(
+                    Version(transformers.__version__) < Version("5.0.0"),
+                    reason="LFM2.5-VL requires transformers>=5.0.0",
+                ),
+            ),
             "trl-internal-testing/tiny-LlavaForConditionalGeneration",
             "trl-internal-testing/tiny-LlavaNextForConditionalGeneration",
+            pytest.param(
+                "trl-internal-testing/tiny-MuseGlimmerForConditionalGeneration",
+                marks=pytest.mark.skipif(
+                    Version(transformers.__version__) < Version("5.15.0"),
+                    reason="Muse Glimmer was introduced in transformers-5.15.0",
+                ),
+            ),
             "trl-internal-testing/tiny-Qwen2VLForConditionalGeneration",
             "trl-internal-testing/tiny-Qwen2_5_VLForConditionalGeneration",
             # "trl-internal-testing/tiny-SmolVLMForConditionalGeneration", seems not to support bf16 properly
@@ -939,7 +1756,7 @@ class TestDPOTrainer(TrlTestCase):
                 ],
             ),
             pytest.param(
-                "trl-internal-testing/tiny-Qwen3_5ForConditionalGeneration",
+                "trl-internal-testing/tiny-Qwen3_5ForConditionalGeneration-NoThink",
                 marks=pytest.mark.skipif(
                     Version(transformers.__version__) < Version("5.2.0"),
                     reason="Qwen3.5 models were introduced in transformers-5.2.0",
@@ -952,9 +1769,15 @@ class TestDPOTrainer(TrlTestCase):
                     reason="Qwen3.5 models were introduced in transformers-5.2.0",
                 ),
             ),
+            pytest.param(
+                "trl-internal-testing/tiny-MuseSparkForConditionalGeneration",
+                marks=pytest.mark.skipif(
+                    Version(transformers.__version__) < Version("5.20.0"),
+                    reason="Muse Spark Open was introduced in transformers-5.20.0",
+                ),
+            ),
         ],
     )
-    @require_vision
     def test_train_vlm(self, model_id):
         dataset = load_dataset("trl-internal-testing/zen-image", "conversational_preference", split="train")
 
@@ -975,24 +1798,19 @@ class TestDPOTrainer(TrlTestCase):
         # Check that the params have changed
         for n, param in previous_trainable_params.items():
             new_param = trainer.model.get_parameter(n)
-            # For some reason, these params are not updated. This is probably not related to TRL, but to
-            # the model itself. We should investigate this further, but for now we just skip these params.
-            # fmt: off
-            if (
-                model_id == "trl-internal-testing/tiny-Gemma3ForConditionalGeneration" and "model.vision_tower.vision_model.head" in n or
-                model_id == "trl-internal-testing/tiny-LlavaForConditionalGeneration" and "model.vision_tower.vision_model.post_layernorm" in n or  # transformers < 5.6.0
-                model_id == "trl-internal-testing/tiny-LlavaForConditionalGeneration" and "vision_tower.vision_model.encoder.layers.1" in n or  # transformers < 5.6.0
-                model_id == "trl-internal-testing/tiny-LlavaForConditionalGeneration" and "model.vision_tower.encoder.layers.1" in n or  # transformers >= 5.6.0, see #5497
-                model_id == "trl-internal-testing/tiny-LlavaForConditionalGeneration" and "model.vision_tower.post_layernorm" in n or  # transformers >= 5.6.0, see #5497
-                model_id == "trl-internal-testing/tiny-LlavaNextForConditionalGeneration" and "model.vision_tower.vision_model.post_layernorm" in n or  # transformers < 5.6.0
-                model_id == "trl-internal-testing/tiny-LlavaNextForConditionalGeneration" and "vision_tower.vision_model.encoder.layers.1" in n or  # transformers < 5.6.0
-                model_id == "trl-internal-testing/tiny-LlavaNextForConditionalGeneration" and "model.vision_tower.encoder.layers.1" in n or  # transformers >= 5.6.0, see #5497
-                model_id == "trl-internal-testing/tiny-LlavaNextForConditionalGeneration" and "model.vision_tower.post_layernorm" in n or  # transformers >= 5.6.0, see #5497
-                model_id == "trl-internal-testing/tiny-Qwen3VLForConditionalGeneration" and "model.visual.deepstack_merger_list" in n
-            ):
-            # fmt: on
-                continue
-            assert not torch.equal(param, new_param), f"Param {n} is not updated"
+            # LLaVA & LLaVA-Next: vision_feature_layer=-2 leaves the last encoder layer (layers.1) and
+            # post_layernorm (pooler-only path) without gradient by design. Assert they stay frozen — if they
+            # ever start training, the feature-selection plumbing has likely regressed.
+            if model_id in (
+                "trl-internal-testing/tiny-LlavaForConditionalGeneration",
+                "trl-internal-testing/tiny-LlavaNextForConditionalGeneration",
+            ) and ("encoder.layers.1" in n or "post_layernorm" in n):
+                assert torch.equal(param, new_param), f"Param {n} expected frozen by LLaVA design, but changed"
+            # Muse Spark Open: no dataset here feeds `audio_tower`, so it gets no gradient. Assert it stays frozen.
+            elif model_id == "trl-internal-testing/tiny-MuseSparkForConditionalGeneration" and "audio_tower" in n:
+                assert torch.equal(param, new_param), f"Param {n} expected frozen, but changed"
+            else:
+                assert not torch.equal(param, new_param), f"Param {n} is not updated"
 
     @pytest.mark.parametrize(
         "model_id",
@@ -1001,11 +1819,10 @@ class TestDPOTrainer(TrlTestCase):
         ],
     )
     @pytest.mark.xfail(
-        parse_version(transformers.__version__) < parse_version("4.57.0"),
+        Version(transformers.__version__) < Version("4.57.0"),
         reason="Mixing text-only and image+text examples is only supported in transformers >= 4.57.0",
         strict=False,
     )
-    @require_vision
     def test_train_vlm_multi_image(self, model_id):
         dataset = load_dataset("trl-internal-testing/zen-multi-image", "conversational_preference", split="train")
 
@@ -1033,38 +1850,6 @@ class TestDPOTrainer(TrlTestCase):
             new_param = trainer.model.get_parameter(n)
             assert not torch.equal(param, new_param), f"Param {n} is not updated"
 
-    # Gemma 3n uses a timm encoder, making it difficult to create a smaller variant for testing.
-    # To ensure coverage, we run tests on the full model but mark them as slow to exclude from default runs.
-    @pytest.mark.slow
-    @require_vision
-    @pytest.mark.skip(reason="Model google/gemma-3n-E2B-it is gated and requires HF token")
-    def test_train_vlm_gemma_3n(self):
-        dataset = load_dataset("trl-internal-testing/zen-image", "conversational_preference", split="train")
-
-        training_args = DPOConfig(
-            output_dir=self.tmp_dir,
-            learning_rate=0.1,  # use higher lr because gradients are tiny and default lr can stall updates
-            max_length=None,  # for VLMs, truncating can remove image tokens, leading to errors
-            per_device_train_batch_size=1,  # VLM training is memory intensive, reduce batch size to avoid OOM
-            model_init_kwargs={"dtype": "bfloat16"},
-            report_to="none",
-        )
-        trainer = DPOTrainer(model="google/gemma-3n-E2B-it", args=training_args, train_dataset=dataset)
-
-        previous_trainable_params = {n: param.clone() for n, param in trainer.model.named_parameters()}
-
-        trainer.train()
-
-        assert trainer.state.log_history[-1]["train_loss"] is not None
-
-        # Check that the params have changed
-        for n, param in previous_trainable_params.items():
-            new_param = trainer.model.get_parameter(n)
-            if "model.audio_tower" in n or "model.embed_audio" in n:
-                # The audio embedding parameters are not updated because this dataset contains no audio data
-                continue
-            assert not torch.equal(param, new_param), f"Param {n} is not updated"
-
     @pytest.mark.parametrize(
         "model_id",
         [
@@ -1075,7 +1860,6 @@ class TestDPOTrainer(TrlTestCase):
         "dataset_config",
         ["conversational_preference", "standard_preference"],
     )
-    @require_vision
     def test_train_vlm_text_only_data(self, model_id, dataset_config):
         dataset = load_dataset("trl-internal-testing/zen", dataset_config, split="train")
 
@@ -1085,6 +1869,9 @@ class TestDPOTrainer(TrlTestCase):
             args=training_args,
             train_dataset=dataset,
         )
+
+        # The vision tower gets no gradients, so DDP must search for unused parameters
+        assert trainer.args.ddp_find_unused_parameters
 
         previous_trainable_params = {n: param.clone() for n, param in trainer.model.named_parameters()}
 
@@ -1100,7 +1887,6 @@ class TestDPOTrainer(TrlTestCase):
             else:
                 assert not torch.equal(param, new_param), f"Param {n} is not updated"
 
-    @require_vision
     def test_train_vlm_with_max_length(self):
         # Regression test for #5283: mm_token_type_ids must be truncated alongside input_ids when max_length is set,
         # otherwise a shape mismatch crashes the model forward pass.
@@ -1120,59 +1906,6 @@ class TestDPOTrainer(TrlTestCase):
         trainer.train()
         assert trainer.state.log_history[-1]["train_loss"] is not None
 
-    @require_peft
-    @require_bitsandbytes
-    def test_peft_with_quantization(self):
-        model_id = "trl-internal-testing/tiny-Qwen2ForCausalLM-2.5"
-
-        quantization_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.float16,
-        )
-        model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            dtype="float32",
-            quantization_config=quantization_config,
-        )
-
-        dataset = load_dataset("trl-internal-testing/zen", "standard_preference", split="train")
-
-        # Initialize the trainer with the already configured PeftModel
-        training_args = DPOConfig(output_dir=self.tmp_dir, learning_rate=0.1, report_to="none")
-        trainer = DPOTrainer(model=model, args=training_args, train_dataset=dataset, peft_config=LoraConfig())
-
-        previous_trainable_params = {n: param.clone() for n, param in trainer.model.named_parameters()}
-
-        trainer.train()
-
-        assert trainer.state.log_history[-1]["train_loss"] is not None
-        assert trainer.state.log_history[-1]["mean_token_accuracy"] is not None
-
-        # Check that the peft params have changed and the base model params have not changed
-        for n, param in previous_trainable_params.items():
-            new_param = trainer.model.get_parameter(n)
-            # In bitsandbytes, bias parameters are automatically cast to the input dtype during the forward pass if
-            # their dtype doesn’t match. This causes the module to change unexpectedly during the first forward pass of
-            # the training. To handle this, we cast these specific bias parameters to float32 before comparison.
-            # https://github.com/bitsandbytes-foundation/bitsandbytes/blob/45553f7392e524eacf400b132cfe01261f6477be/bitsandbytes/nn/modules.py#L518
-            # We still need to investigate why the compute dtype ends up being different than for these parameters.
-            if n in [
-                "base_model.model.model.layers.1.self_attn.k_proj.bias",
-                "base_model.model.model.layers.1.self_attn.q_proj.base_layer.bias",
-                "base_model.model.model.layers.1.self_attn.v_proj.base_layer.bias",
-            ]:
-                param = param.float()
-
-            if "lora" not in n:  # We expect the base model params to be the same
-                torch.testing.assert_close(param, new_param, msg=f"Parameter {n} has changed.")
-            elif "lora" in n:  # We expect the peft params to be different
-                assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
-            else:
-                raise ValueError(f"Unexpected parameter {n} in model: {trainer.model}")
-
-    @require_vision
     def test_train_vlm_keep_end_raises(self):
         # Regression test for #5285: keep_end with a VLM must raise at init time, not silently corrupt training.
         # Image tokens live at the start of the sequence (in the prompt); keep_end would drop them.
@@ -1190,3 +1923,46 @@ class TestDPOTrainer(TrlTestCase):
                 args=training_args,
                 train_dataset=dataset,
             )
+
+    def test_vision_dataset_with_text_model_raises(self):
+        dataset = load_dataset("trl-internal-testing/zen-image", "conversational_preference", split="train")
+        training_args = DPOConfig(output_dir=self.tmp_dir, report_to="none")
+        with pytest.raises(ValueError, match="vision-related.*vision-language model"):
+            DPOTrainer(
+                model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
+                args=training_args,
+                train_dataset=dataset,
+            )
+
+    def test_precompute_ref_log_probs_raises_for_vision(self):
+        dataset = load_dataset("trl-internal-testing/zen-image", "conversational_preference", split="train")
+        training_args = DPOConfig(output_dir=self.tmp_dir, report_to="none", precompute_ref_log_probs=True)
+        with pytest.raises(ValueError, match="precompute_ref_log_probs.*not supported for vision datasets"):
+            DPOTrainer(
+                model="trl-internal-testing/tiny-Qwen2_5_VLForConditionalGeneration",
+                args=training_args,
+                train_dataset=dataset,
+            )
+
+    def test_pad_token_synced_with_model_config_vision(self):
+        # A vision dataset takes the other collator branch, which used to skip the pad token handling entirely, so
+        # the requested pad token reached neither the tokenizer nor the model configs.
+        dataset = load_dataset("trl-internal-testing/zen-image", "conversational_preference", split="train")
+
+        with pytest.warns(FutureWarning, match="`pad_token` is deprecated"):
+            training_args = DPOConfig(
+                output_dir=self.tmp_dir,
+                max_length=None,  # for VLMs, truncating can remove image tokens, leading to errors
+                pad_token="<|fim_pad|>",
+                report_to="none",
+            )
+        trainer = DPOTrainer(
+            model="trl-internal-testing/tiny-Qwen2_5_VLForConditionalGeneration",
+            args=training_args,
+            train_dataset=dataset,
+        )
+
+        pad_token_id = trainer.processing_class.tokenizer.convert_tokens_to_ids("<|fim_pad|>")
+        assert trainer.processing_class.tokenizer.pad_token_id == pad_token_id
+        assert trainer.model.config.get_text_config().pad_token_id == pad_token_id
+        assert trainer.model.generation_config.pad_token_id == pad_token_id

@@ -25,6 +25,10 @@ _import_structure = {
         "SyncRefModelCallback",
         "WeaveCallback",
     ],
+    "async_grpo_config": ["AsyncGRPOConfig"],
+    "async_grpo_trainer": ["AsyncGRPOTrainer"],
+    "distillation_config": ["DistillationConfig"],
+    "distillation_trainer": ["DistillationTrainer"],
     "dpo_config": ["DPOConfig"],
     "dpo_trainer": ["DPOTrainer"],
     "grpo_config": ["GRPOConfig"],
@@ -39,16 +43,17 @@ _import_structure = {
     "sft_config": ["SFTConfig"],
     "sft_trainer": ["SFTTrainer"],
     "utils": [
+        "add_fused_lm_head",
         "disable_dropout_in_model",
         "ensure_master_addr_port",
-        "get_kbit_device_map",
         "get_peft_config",
         "get_quantization_config",
-        "patch_chunked_lm_head",
     ],
 }
 
 if TYPE_CHECKING:
+    from .async_grpo_config import AsyncGRPOConfig
+    from .async_grpo_trainer import AsyncGRPOTrainer
     from .callbacks import (
         BEMACallback,
         LogCompletionsCallback,
@@ -56,6 +61,8 @@ if TYPE_CHECKING:
         SyncRefModelCallback,
         WeaveCallback,
     )
+    from .distillation_config import DistillationConfig
+    from .distillation_trainer import DistillationTrainer
     from .dpo_config import DPOConfig
     from .dpo_trainer import DPOTrainer
     from .grpo_config import GRPOConfig
@@ -70,12 +77,11 @@ if TYPE_CHECKING:
     from .sft_config import SFTConfig
     from .sft_trainer import SFTTrainer
     from .utils import (
+        add_fused_lm_head,
         disable_dropout_in_model,
         ensure_master_addr_port,
-        get_kbit_device_map,
         get_peft_config,
         get_quantization_config,
-        patch_chunked_lm_head,
     )
 else:
     import sys
